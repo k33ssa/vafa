@@ -146,6 +146,28 @@ function Show-Picker {
     [void]$f.ShowDialog()
 }
 
+# ---- журнал: новые записи сверху --------------------------------------------
+function Get-ReversedLog {
+    $p = Join-Path $Root 'vpn-guard.log'
+    if (-not (Test-Path $p)) { return 'Журнал пуст' }
+    $lines = @(Get-Content $p -Tail 2000 -Encoding UTF8)
+    [array]::Reverse($lines)
+    $lines -join "`r`n"
+}
+function Show-Log {
+    $f = New-Object Windows.Forms.Form
+    $f.Text = 'Vafa — журнал (новые сверху)'; $f.Size = New-Object Drawing.Size 820, 560; $f.StartPosition = 'CenterScreen'
+    $tb = New-Object Windows.Forms.TextBox
+    $tb.Multiline = $true; $tb.ReadOnly = $true; $tb.ScrollBars = 'Both'; $tb.WordWrap = $false; $tb.Dock = 'Fill'
+    $tb.Font = New-Object Drawing.Font 'Consolas', 9
+    $tb.Text = Get-ReversedLog; $tb.SelectionStart = 0
+    $f.Controls.Add($tb)
+    $tm = New-Object Windows.Forms.Timer; $tm.Interval = 2000
+    $tm.Add_Tick({ $t = Get-ReversedLog; if ($tb.Text -ne $t) { $tb.Text = $t; $tb.SelectionStart = 0 } }); $tm.Start()
+    $f.Add_FormClosed({ $tm.Stop() })
+    [void]$f.ShowDialog()
+}
+
 # ---- трей -------------------------------------------------------------------
 $ni = New-Object Windows.Forms.NotifyIcon
 $ni.Visible = $true
@@ -192,7 +214,7 @@ function Rebuild-Menu {
     })
     [void]$menu.Items.Add($li)
     [void]$menu.Items.Add('-')
-    $menu.Items.Add('Открыть журнал').Add_Click({ Start-Process notepad.exe (Join-Path $Root 'vpn-guard.log') })
+    $menu.Items.Add('Открыть журнал').Add_Click({ Show-Log })
     $menu.Items.Add('Выход').Add_Click({ $ni.Visible = $false; [Windows.Forms.Application]::Exit() })
 }
 $menu.Add_Opening({ Rebuild-Menu })

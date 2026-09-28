@@ -158,6 +158,8 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
     let menu = NSMenu()
     let picker = PickerModel()
     var window: NSWindow?
+    var logWindow: NSWindow?
+    var logView: NSTextView?
     var last: GuardStatus?
 
     func applicationDidFinishLaunching(_ n: Notification) {
@@ -305,8 +307,36 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
         setLoginItem(!loginItemOn())
     }
 
+    // Журнал в своём окне: новые записи сверху. Сам файл пишется по порядку (дописывание
+    // в конец), здесь только показываем последние 2000 строк в обратном порядке.
+    func reversedLog() -> String {
+        guard let data = FileManager.default.contents(atPath: "/usr/local/var/log/vpn-guard.log"),
+              let text = String(data: data, encoding: .utf8) else { return "Журнал пуст или недоступен" }
+        return text.split(separator: "\n").suffix(2000).reversed().joined(separator: "\n")
+    }
+
     @objc func openLog() {
-        NSWorkspace.shared.open(URL(fileURLWithPath: "/usr/local/var/log/vpn-guard.log"))
+        if logWindow == nil {
+            let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 760, height: 520),
+                             styleMask: [.titled, .closable, .resizable, .miniaturizable], backing: .buffered, defer: false)
+            w.title = "Vafa — журнал (новые сверху)"
+            w.isReleasedWhenClosed = false
+            let scroll = NSTextView.scrollableTextView()
+            let tv = scroll.documentView as! NSTextView
+            tv.isEditable = false
+            tv.font = .monospacedSystemFont(ofSize: 11, weight: .regular)
+            w.contentView = scroll
+            w.center()
+            logWindow = w; logView = tv
+            Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in
+                guard let self = self, self.logWindow?.isVisible == true else { return }
+                self.logView?.string = self.reversedLog()
+            }
+        }
+        logView?.string = reversedLog()
+        logView?.scrollToBeginningOfDocument(nil)
+        NSApp.activate(ignoringOtherApps: true)
+        logWindow?.makeKeyAndOrderFront(nil)
     }
 
     @objc func openPicker() {

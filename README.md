@@ -1,8 +1,11 @@
 # VPN Guard
 
-# Quick install 
+## Quick install
+
+**macOS** (нужны Xcode Command Line Tools: `xcode-select --install`):
 
 ```bash
+cd ~
 git clone https://github.com/k33ssa/vafa
 cd vafa
 ./app/build.sh
@@ -14,7 +17,13 @@ sudo ./install.sh
 ```bash
 sudo vpn-guard status
 ```
-# О приложении 
+
+**Windows 10/11**: скачать репозиторий (Code → Download ZIP), распаковать, открыть
+папку `windows` и дважды щёлкнуть `install.cmd` — он сам попросит права
+администратора. Щит появится в трее (возможно, под стрелкой ^ у часов).
+Подробнее — [INSTALL.md](INSTALL.md).
+
+## О приложении
 
 Не даёт пользоваться выбранными приложениями на macOS, пока не включён VPN.
 
@@ -30,25 +39,6 @@ sudo vpn-guard status
 **VPN Guard.app** — окно и значок в строке меню: статус
 (`Claude — запуск: разблокировано, процессов: 20`) и галочки «какие приложения
 охранять».
-
-## Быстрая установка
-
-**macOS** (нужны Xcode Command Line Tools: `xcode-select --install`):
-
-```bash
-cd ~
-git clone https://github.com/k33ssa/vafa
-cd vafa
-./app/build.sh
-sudo ./install.sh
-```
-
-Щит сразу появится в строке меню. Проверить: `sudo vpn-guard status`.
-
-**Windows 10/11**: скачать репозиторий (Code → Download ZIP), распаковать, открыть
-папку `windows` и дважды щёлкнуть `install.cmd` — он сам попросит права
-администратора. Щит появится в трее (возможно, под стрелкой ^ у часов).
-Подробнее — [INSTALL.md](INSTALL.md).
 
 ## Как понимается, что VPN включён
 

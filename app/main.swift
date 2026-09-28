@@ -153,8 +153,22 @@ struct StatusView: View {
 
 // MARK: - строка меню
 
+// Новый значок macOS ставит левее всех — при забитой строке меню он уходит под вырез
+// камеры и его не видно. Поэтому при первом запуске просим место ближе к часам
+// (расстояние от правого края). Если пользователь потом перетащит щит с ⌘, macOS
+// запишет своё значение и мы его не трогаем.
+let positionKey = "NSStatusItem Preferred Position Item-0"
+func placeStatusItemNearClock() {
+    if UserDefaults.standard.object(forKey: positionKey) == nil {
+        UserDefaults.standard.set(260.0, forKey: positionKey)
+    }
+}
+
 final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
-    let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+    let item: NSStatusItem = {
+        placeStatusItemNearClock()
+        return NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+    }()
     let menu = NSMenu()
     let picker = PickerModel()
     var window: NSWindow?

@@ -1,0 +1,665 @@
+#!/bin/zsh
+#
+# vpn-guard — не даёт открыть и использовать выбранные приложения, пока не поднят VPN.
+#
+# Ставится как LaunchDaemon (root). Опрашивает состояние VPN и, если VPN выключен:
+#   * снимает бит +x с исполняемых файлов бандла — приложение не запускается НИЧЕМ:
+#     ни из Dock, ни из Spotlight, ни через `open -a`, ни прямым вызовом бинаря;
+#   * замораживает (SIGSTOP) или убивает уже запущенные процессы приложения;
+#   * (если задан BLOCK_NETS) через pf режет сеть к этим адресам мимо туннеля —
+#     так блокируется и сайт в любом браузере, и CLI.
+# Когда VPN поднимается — права возвращаются, процессы размораживаются.
+#
+# Подкоманды: daemon | status | check | lock | unlock | uninstall
+
+emulate -L zsh
+zmodload zsh/datetime
+setopt no_nomatch
+set -u
+
+CONF=${VPN_GUARD_CONF:-/usr/local/etc/vpn-guard.conf}
+STATE_DIR=${VPN_GUARD_STATE:-/usr/local/var/vpn-guard}
+PERM_DIR=$STATE_DIR/perms
+PLIST=/Library/LaunchDaemons/local.vpnguard.plist
+
+# ---- значения по умолчанию (перекрываются конфигом) -------------------------
+typeset -ga APPS=()
+typeset -ga VPN_CHECK=( route )
+typeset -ga BLOCK_NETS=()
+VPN_REQUIRE=all      # all | any
+ON_DOWN=freeze       # freeze | kill
+LOCK_LAUNCH=1
+MATCH_ANY_PATH=0
+INTERVAL=2
+GRACE=0
+NOTIFY=1
+GEO_TTL=15
+GEO_STALE=60
+APPS_FILE=${VPN_GUARD_APPS:-/usr/local/etc/vpn-guard.apps}
+STATUS_FILE=$STATE_DIR/status.json
+
+typeset -gA TERMED=()
+typeset -gA WARNED=()
+
+# ---- служебное --------------------------------------------------------------
+log() {
+  print -r -- "$(strftime '%F %T' $EPOCHSECONDS) $*"
+  logger -t vpn-guard -- "$*" 2>/dev/null
+  return 0
+}
+
+warn_once() {
+  local key=$1; shift
+  [[ -n ${WARNED[$key]:-} ]] && return 0
+  WARNED[$key]=1
+  log "$*"
+}
+
+die() { print -ru2 -- "vpn-guard: $*"; exit 1; }
+
+need_root() { (( EUID == 0 )) || die "нужны права root — запусти через sudo"; }
+
+state_key() {
+  local app=$1 base h
+  base=${app:t}
+  base=${base// /_}
+  (( ${#base} > 60 )) && base=${base[1,60]}
+  if [[ -x /sbin/md5 ]]; then
+    h=$(/sbin/md5 -q -s "$app")
+  else
+    h=$(print -r -- "$app" | shasum -a 256 | cut -c1-32)
+  fi
+  print -r -- "${base}-${h}"
+}
+
+notify() {
+  (( NOTIFY )) || return 0
+  local uid
+  uid=$(stat -f '%u' /dev/console 2>/dev/null) || return 0
+  [[ -n $uid && $uid != 0 ]] || return 0
+  # в фоне: osascript отвечает секундами, а блокировка не должна его ждать
+  launchctl asuser $uid osascript \
+    -e "display notification \"$2\" with title \"VPN Guard\" subtitle \"$1\"" >/dev/null 2>&1 &!
+  return 0
+}
+
+# ---- конфиг -----------------------------------------------------------------
+conf_is_safe() {
+  local f=$1 owner mode
+  [[ -f $f ]] || { log "конфиг $f не найден"; return 1; }
+  [[ -r $f ]] || { log "конфиг $f недоступен на чтение (нужен sudo)"; return 1; }
+  owner=$(stat -f '%u' -- $f) || return 1
+  mode=$(stat -f '%OLp' -- $f) || return 1
+  if [[ $owner != 0 && $owner != $EUID ]]; then
+    log "конфиг $f не принадлежит root — не читаю его"
+    return 1
+  fi
+  if (( 8#$mode & 8#022 )); then
+    log "конфиг $f доступен на запись группе или всем — не читаю его"
+    return 1
+  fi
+  return 0
+}
+
+validate_conf() {
+  [[ $VPN_REQUIRE == (all|any) ]] || { log "VPN_REQUIRE=$VPN_REQUIRE — беру all"; VPN_REQUIRE=all }
+  [[ $ON_DOWN == (freeze|kill) ]] || { log "ON_DOWN=$ON_DOWN — беру freeze"; ON_DOWN=freeze }
+  [[ $INTERVAL == <1-3600> ]]     || { log "INTERVAL=$INTERVAL — беру 2"; INTERVAL=2 }
+  [[ $GEO_TTL == <1-3600> ]]      || { log "GEO_TTL=$GEO_TTL — беру 15"; GEO_TTL=15 }
+  [[ $GEO_STALE == <0-3600> ]]    || { log "GEO_STALE=$GEO_STALE — беру 60"; GEO_STALE=60 }
+  [[ $GRACE == <0-3600> ]]        || { log "GRACE=$GRACE — беру 0"; GRACE=0 }
+  (( ${#VPN_CHECK} )) || { log "VPN_CHECK пуст — беру route"; VPN_CHECK=( route ) }
+}
+
+# Список приложений из мини-приложения (VPN Guard.app). Если файл есть — он главнее
+# APPS из конфига. Одна строка — один путь к .app. Принимаются только .app в
+# /Applications или ~/Applications, без «..» — демон от root делает chmod по этим
+# путям, так что произвольный путь сюда пускать нельзя.
+load_apps_file() {
+  [[ -e $APPS_FILE ]] || return 1
+  conf_is_safe $APPS_FILE || return 1
+  local line; local -a out=()
+  while IFS= read -r line || [[ -n $line ]]; do
+    [[ -z $line || $line == \#* ]] && continue
+    if [[ $line == (/Applications/|/Users/[^/]##/Applications/)*.app && $line != *..* && $line != */.app ]]; then
+      out+=( $line )
+    else
+      warn_once "badapp:$line" "в $APPS_FILE пропускаю недопустимый путь: $line"
+    fi
+  done < $APPS_FILE
+  APPS=( $out[@] )
+  return 0
+}
+
+load_conf() {
+  if conf_is_safe $CONF; then
+    source $CONF
+  else
+    log "список приложений пуст — vpn-guard ничего не делает"
+    APPS=()
+  fi
+  load_apps_file
+  validate_conf
+}
+
+conf_mtime() { print "$(stat -f '%m' -- $CONF 2>/dev/null || print 0)/$(stat -f '%m' -- $APPS_FILE 2>/dev/null || print 0)" }
+
+# ---- определение VPN --------------------------------------------------------
+_default_iface() {
+  route -n get default 2>/dev/null | awk '/interface: /{print $2; exit}'
+}
+
+_route_is_vpn() {
+  local i
+  i=$(_default_iface)
+  case $i in
+    (utun*|ppp*|ipsec*|tun*|tap*) return 0 ;;
+  esac
+  return 1
+}
+
+_nc_connected() {
+  local want=$1
+  if [[ -z $want ]]; then
+    scutil --nc list 2>/dev/null | grep -q '(Connected)'
+  else
+    scutil --nc list 2>/dev/null | grep -F -- "\"$want\"" | grep -q '(Connected)'
+  fi
+}
+
+# страна, из которой нас видит интернет (Cloudflare trace). Кэш на GEO_TTL секунд,
+# сбрасывается при смене интерфейса маршрута по умолчанию. Глобальные переменные,
+# потому что _one_check нельзя звать в подоболочке — кэш бы терялся.
+#
+# Один неответивший запрос — ещё не повод блокировать: по журналу за 2026-09-11..28
+# 372 из 441 блокировки были с «страна: ?» при живом туннеле, т.е. Cloudflare просто
+# не ответил за 4 с. Поэтому: до трёх попыток (второй адрес — по IP, мимо DNS), а
+# если все мимо — на том же интерфейсе ещё GEO_STALE секунд верим последнему ответу.
+typeset -g GEO_LAST_T=0 GEO_LAST_IF='' GEO_LAST_CC='' GEO_GOOD_T=0 GEO_GOOD_CC=''
+_geo_fetch() {
+  curl -s --max-time 4 $1 2>/dev/null | awk -F= '$1=="loc"{print $2; exit}'
+}
+_geo_refresh() {
+  local i cc='' url
+  i=$(_default_iface)
+  if (( EPOCHSECONDS - GEO_LAST_T >= GEO_TTL )) || [[ $i != $GEO_LAST_IF ]]; then
+    for url in https://www.cloudflare.com/cdn-cgi/trace https://1.1.1.1/cdn-cgi/trace \
+               https://www.cloudflare.com/cdn-cgi/trace; do
+      cc=$(_geo_fetch $url)
+      [[ -n $cc ]] && break
+    done
+    [[ $i == $GEO_LAST_IF ]] || GEO_GOOD_T=0
+    if [[ -n $cc ]]; then
+      GEO_GOOD_T=$EPOCHSECONDS GEO_GOOD_CC=$cc
+    elif (( GEO_GOOD_T && EPOCHSECONDS - GEO_GOOD_T < GEO_STALE )); then
+      cc=$GEO_GOOD_CC
+      warn_once "geostale:$GEO_GOOD_T" "Cloudflare не ответил — пока верю прошлой стране $cc"
+    fi
+    GEO_LAST_CC=$cc
+    GEO_LAST_T=$EPOCHSECONDS
+    GEO_LAST_IF=$i
+  fi
+}
+
+# geo:!RU    — страна выхода НЕ из списка;  geo:FR,NL — страна выхода из списка.
+# Нет ответа (нет сети, Cloudflare недоступен) — считаем, что VPN нет.
+_geo_ok() {
+  local spec=$1
+  _geo_refresh
+  [[ -n $GEO_LAST_CC ]] || return 1
+  if [[ $spec == \!* ]]; then
+    local -a bad=( ${(s:,:)${spec#\!}} )
+    (( ${bad[(I)$GEO_LAST_CC]} )) && return 1
+    return 0
+  fi
+  local -a good=( ${(s:,:)spec} )
+  (( ${good[(I)$GEO_LAST_CC]} ))
+}
+
+_one_check() {
+  local rule=$1
+  case $rule in
+    (route)     _route_is_vpn ;;
+    (geo:*)     _geo_ok "${rule#geo:}" ;;
+    (scutil)    _nc_connected '' ;;
+    (nc:*)      _nc_connected "${rule#nc:}" ;;
+    (iface:*)   ifconfig ${rule#iface:} 2>/dev/null | grep -q 'inet ' ;;
+    (default-iface:*) [[ $(_default_iface) == ${rule#default-iface:} ]] ;;
+    (proc:*)    pgrep -x -- ${rule#proc:} >/dev/null 2>&1 ;;
+    (script:*)  ${rule#script:} >/dev/null 2>&1 ;;
+    (*)         warn_once "rule:$rule" "неизвестное правило VPN_CHECK: $rule — считаю его невыполненным"; return 1 ;;
+  esac
+}
+
+vpn_up() {
+  local rule ok
+  if [[ $VPN_REQUIRE == all ]]; then
+    for rule in $VPN_CHECK[@]; do
+      _one_check $rule || return 1
+    done
+    return 0
+  else
+    for rule in $VPN_CHECK[@]; do
+      _one_check $rule && return 0
+    done
+    return 1
+  fi
+}
+
+# ---- работа с бандлом -------------------------------------------------------
+app_exe_names() {
+  local d=$1/Contents/MacOS f
+  for f in $d/*(.N); do print -r -- ${f:t}; done
+}
+
+app_pids() {
+  local app=$1
+  local prefix=$app/Contents/
+  local -a names=()
+  (( MATCH_ANY_PATH )) && names=( ${(f)"$(app_exe_names $app)"} )
+  local pid rest
+  ps -axww -o pid=,comm= | while read -r pid rest; do
+    [[ -n $rest ]] || continue
+    if [[ $rest == $prefix* ]]; then
+      print -r -- $pid
+      continue
+    fi
+    if (( MATCH_ANY_PATH )) && (( ${names[(I)${rest:t}]} )); then
+      print -r -- $pid
+    fi
+  done
+}
+
+lock_app() {
+  local app=$1
+  local exedir=$app/Contents/MacOS
+  local stfile=$PERM_DIR/$(state_key $app)
+  if [[ ! -d $exedir ]]; then
+    warn_once "noexe:$app" "не нашёл $exedir — проверь путь в конфиге"
+    return 1
+  fi
+  local -a files=( $exedir/*(.N) )
+  (( ${#files} )) || { warn_once "empty:$app" "в $exedir нет исполняемых файлов"; return 1 }
+
+  local had_state=0
+  [[ -e $stfile ]] && had_state=1
+
+  typeset -A saved=()
+  local m p
+  if (( had_state )); then
+    while IFS=$'\t' read -r m p; do
+      [[ -z $p || $m == \#* ]] && continue
+      saved[$p]=$m
+    done < $stfile
+  fi
+
+  local f mode changed=0 failed=0
+  for f in $files[@]; do
+    mode=$(stat -f '%OLp' -- $f 2>/dev/null) || continue
+    (( 8#$mode & 0111 )) || continue
+    [[ -n ${saved[$f]:-} ]] || saved[$f]=$mode
+    if chmod a-x $f 2>/dev/null; then changed=1; else failed=1; fi
+  done
+
+  if (( ${#saved} )); then
+    mkdir -p $PERM_DIR
+    { print -r -- "# app: $app"
+      for p in ${(k)saved}; do printf '%s\t%s\n' ${saved[$p]} $p; done
+    } > $stfile
+  fi
+
+  if (( had_state == 0 )); then
+    (( changed )) && log "заблокирован запуск: $app"
+    (( failed )) && warn_once "nochmod:$app" "ВНИМАНИЕ: macOS не даёт менять файлы в $exedir (защита «Управление приложениями») — запуск не блокируется, только заморозка процессов. Дать право: Настройки → Конфиденциальность → Управление приложениями → /bin/zsh"
+  fi
+  return 0
+}
+
+unlock_app() {
+  local app=$1
+  local stfile=$PERM_DIR/$(state_key $app)
+  [[ -e $stfile ]] || return 0
+  local m p
+  while IFS=$'\t' read -r m p; do
+    [[ -z $p || $m == \#* ]] && continue
+    [[ -e $p ]] || continue
+    chmod $m $p 2>/dev/null || log "не смог вернуть права $m на $p"
+  done < $stfile
+  rm -f $stfile
+  log "снята блокировка запуска: $app"
+  return 0
+}
+
+freeze_app() {
+  local app=$1 pid st
+  for pid in ${(f)"$(app_pids $app)"}; do
+    [[ -n $pid ]] || continue
+    st=$(ps -o state= -p $pid 2>/dev/null)
+    [[ $st == T* ]] && continue
+    kill -STOP $pid 2>/dev/null && log "заморожен процесс $pid (${app:t})"
+  done
+  return 0
+}
+
+resume_app() {
+  local app=$1 pid st
+  for pid in ${(f)"$(app_pids $app)"}; do
+    [[ -n $pid ]] || continue
+    st=$(ps -o state= -p $pid 2>/dev/null)
+    [[ $st == T* ]] || continue
+    kill -CONT $pid 2>/dev/null && log "разморожен процесс $pid (${app:t})"
+  done
+  return 0
+}
+
+kill_app() {
+  local app=$1 pid
+  for pid in ${(f)"$(app_pids $app)"}; do
+    [[ -n $pid ]] || continue
+    if [[ -n ${TERMED[$pid]:-} ]]; then
+      kill -KILL $pid 2>/dev/null && log "убит процесс $pid (${app:t}, SIGKILL)"
+    else
+      TERMED[$pid]=1
+      kill -TERM $pid 2>/dev/null && log "закрываю процесс $pid (${app:t}, SIGTERM)"
+    fi
+  done
+  return 0
+}
+
+# ---- сетевой блок через pf --------------------------------------------------
+# Якорь внутри com.apple/* — он уже подключён в штатном /etc/pf.conf,
+# поэтому системный конфиг править не нужно.
+PF_ANCHOR=com.apple/vpn-guard
+PF_CUR=''
+
+pf_rules() {
+  local via=${1:-}
+  print -r -- "table <vpnguard> const { ${(j:, :)BLOCK_NETS} }"
+  [[ -n $via ]] && print -r -- "pass out quick on $via to <vpnguard>"
+  print -r -- "block return out quick to <vpnguard>"
+}
+
+pf_enable() {
+  # после перезагрузки pf выключен, а старый токен остаётся на диске —
+  # поэтому смотреть на реальный статус, а не на наличие файла
+  if [[ -s $STATE_DIR/pf.token ]] && pfctl -s info 2>/dev/null | grep -q 'Status: Enabled'; then
+    return 0
+  fi
+  rm -f $STATE_DIR/pf.token
+  local tok
+  tok=$(pfctl -E 2>&1 | awk '/[Tt]oken/{print $NF; exit}')
+  [[ -n $tok ]] && print -r -- $tok > $STATE_DIR/pf.token
+  return 0
+}
+
+pf_kill_states() {
+  local n any
+  for n in $BLOCK_NETS[@]; do
+    [[ $n == *:* ]] && any=::/0 || any=0.0.0.0/0
+    pfctl -k $any -k $n >/dev/null 2>&1
+  done
+  return 0
+}
+
+# block      — к BLOCK_NETS нельзя никак
+# via:utunN  — можно только через этот туннель (падение VPN режется мгновенно,
+#              не дожидаясь следующего опроса)
+# open       — правил нет (VPN признан поднятым, но маршрут не через туннель)
+pf_apply() {
+  local mode=$1
+  (( ${#BLOCK_NETS} )) || return 0
+  [[ $mode == $PF_CUR ]] && return 0
+  if [[ $mode == open ]]; then
+    pfctl -a $PF_ANCHOR -F all >/dev/null 2>&1
+    PF_CUR=open
+    log "сеть к заблокированным адресам: открыта (маршрут не через туннель)"
+    return 0
+  fi
+  pf_enable
+  local via=''
+  [[ $mode == via:* ]] && via=${mode#via:}
+  # "$via" в кавычках: пустая строка без кавычек в zsh исчезает совсем,
+  # pf_rules падал на set -u и в pf уходил ПУСТОЙ набор правил
+  pf_rules "$via" | pfctl -a $PF_ANCHOR -f - >/dev/null 2>&1
+  # код возврата pfctl не доказывает, что правила на месте — проверить глазами
+  if pfctl -a $PF_ANCHOR -s rules 2>/dev/null | grep -q '^block'; then
+    PF_CUR=$mode
+    if [[ -n $via ]]; then
+      log "сеть к заблокированным адресам: только через $via"
+    else
+      log "сеть к заблокированным адресам: ЗАКРЫТА"
+    fi
+    pf_kill_states   # оборвать уже открытые соединения
+  else
+    PF_CUR=''   # повторить на следующем круге
+    warn_once pfload "не удалось загрузить правила pf в $PF_ANCHOR — проверь BLOCK_NETS"
+  fi
+  return 0
+}
+
+pf_off() {
+  pfctl -a $PF_ANCHOR -F all >/dev/null 2>&1
+  if [[ -s $STATE_DIR/pf.token ]]; then
+    pfctl -X $(<$STATE_DIR/pf.token) >/dev/null 2>&1
+    rm -f $STATE_DIR/pf.token
+  fi
+  PF_CUR=''
+  return 0
+}
+
+pf_mode_when_up() {
+  local i
+  i=$(_default_iface)
+  case $i in
+    (utun*|ppp*|ipsec*|tun*|tap*) print -r -- "via:$i" ;;
+    (*) print -r -- open ;;
+  esac
+}
+
+# Состояние для VPN Guard.app: демон пишет его на каждом круге, приложение читает
+# без sudo. Только чтение — управлять демоном через этот файл нельзя.
+json_str() {
+  local s=$1
+  s=${s//\\/\\\\}; s=${s//\"/\\\"}
+  print -rn -- "\"$s\""
+}
+
+write_status() {
+  local vpn=$1 a pid st n fz lk sep='' tmp=$STATUS_FILE.tmp
+  {
+    print -rn -- "{\"time\":$EPOCHSECONDS,\"vpn\":$vpn,\"iface\":$(json_str "$(_default_iface)"),"
+    print -rn -- "\"country\":$(json_str "$GEO_LAST_CC"),\"on_down\":$(json_str $ON_DOWN),\"apps\":["
+    for a in $APPS[@]; do
+      n=0 fz=0 lk=false
+      for pid in ${(f)"$(app_pids $a)"}; do
+        [[ -n $pid ]] || continue
+        (( n++ ))
+        st=$(ps -o state= -p $pid 2>/dev/null)
+        [[ $st == T* ]] && (( fz++ ))
+      done
+      [[ -e $PERM_DIR/$(state_key $a) ]] && lk=true
+      print -rn -- "$sep{\"path\":$(json_str $a),\"locked\":$lk,\"procs\":$n,\"frozen\":$fz}"
+      sep=,
+    done
+    print -r -- "]}"
+  } > $tmp && chmod 644 $tmp && mv -f $tmp $STATUS_FILE
+  return 0
+}
+
+# снять блокировку с того, чего уже нет в конфиге
+prune_stale_locks() {
+  local sf app
+  for sf in $PERM_DIR/*(.N); do
+    app=$(head -1 $sf 2>/dev/null)
+    app=${app#\# app: }
+    [[ -n $app ]] || continue
+    (( ${APPS[(I)$app]} )) && continue
+    log "$app убран из конфига — снимаю блокировку"
+    unlock_app $app
+  done
+  return 0
+}
+
+# ---- подкоманды -------------------------------------------------------------
+cmd_daemon() {
+  need_root
+  mkdir -p $PERM_DIR
+  chmod 755 $STATE_DIR   # status.json должен читаться без sudo; perms/ остаётся 700
+  load_conf
+  local a last=init down_since=0 mt=$(conf_mtime)
+  log "vpn-guard запущен: правила=[${VPN_CHECK[*]}] ($VPN_REQUIRE), при падении VPN=$ON_DOWN, блокировка запуска=$LOCK_LAUNCH, интервал=${INTERVAL}с"
+  (( ${#APPS} )) || log "ВНИМАНИЕ: список APPS пуст — сторожить нечего"
+  prune_stale_locks
+
+  while :; do
+    if [[ $(conf_mtime) != $mt ]]; then
+      mt=$(conf_mtime)
+      log "конфиг изменился — перечитываю"
+      load_conf
+      prune_stale_locks
+      last=init
+      PF_CUR=''
+      (( ${#BLOCK_NETS} )) || pf_off
+    fi
+
+    if vpn_up; then
+      if [[ $last != up ]]; then
+        log "VPN поднят — снимаю блокировку"
+        [[ $last == down ]] && notify "VPN поднят" "приложения разблокированы"
+        last=up
+      fi
+      down_since=0
+      TERMED=()
+      for a in $APPS[@]; do
+        unlock_app $a
+        resume_app $a
+      done
+      pf_apply $(pf_mode_when_up)
+      write_status true
+    else
+      (( down_since )) || down_since=$EPOCHSECONDS
+      if (( EPOCHSECONDS - down_since >= GRACE )); then
+        if [[ $last != down ]]; then
+          log "VPN не обнаружен (маршрут: $(_default_iface), страна: ${GEO_LAST_CC:-?}) — блокирую"
+          notify "VPN выключен" "приложения заблокированы"
+          last=down
+        fi
+        for a in $APPS[@]; do
+          (( LOCK_LAUNCH )) && lock_app $a
+          case $ON_DOWN in
+            (freeze) freeze_app $a ;;
+            (kill)   kill_app $a ;;
+          esac
+        done
+        pf_apply block
+      fi
+      write_status false
+    fi
+    sleep $INTERVAL
+  done
+}
+
+cmd_check() {
+  load_conf >/dev/null 2>&1
+  local rule
+  for rule in $VPN_CHECK[@]; do
+    local note=''
+    if _one_check $rule; then note="  [ да ] $rule"; else note="  [ нет] $rule"; fi
+    [[ $rule == geo:* ]] && note+="   (страна выхода: ${GEO_LAST_CC:-нет ответа})"
+    print -r -- $note
+  done
+  if vpn_up; then
+    print -r -- "VPN: ПОДНЯТ (правило $VPN_REQUIRE)"
+    return 0
+  else
+    print -r -- "VPN: ВЫКЛЮЧЕН (правило $VPN_REQUIRE)"
+    return 1
+  fi
+}
+
+cmd_status() {
+  load_conf >/dev/null 2>&1
+  print -r -- "default route -> $(_default_iface)"
+  cmd_check
+  print
+  print -r -- "Приложения под охраной:"
+  (( ${#APPS} )) || print -r -- "  (список пуст)"
+  local a stfile n locked
+  for a in $APPS[@]; do
+    stfile=$PERM_DIR/$(state_key $a)
+    [[ -e $stfile ]] && locked="ЗАБЛОКИРОВАНО" || locked="разблокировано"
+    n=$(app_pids $a | grep -c . )
+    print -r -- "  $a"
+    print -r -- "      запуск: $locked, процессов: $n"
+  done
+  print
+  print -r -- "Сетевой блок (pf, $PF_ANCHOR):"
+  if (( ! ${#BLOCK_NETS} )); then
+    print -r -- "  не настроен (BLOCK_NETS пуст)"
+  elif (( EUID != 0 )); then
+    print -r -- "  (посмотреть можно только через sudo)"
+  else
+    local r
+    r=$(pfctl -a $PF_ANCHOR -s rules 2>/dev/null)
+    if [[ -n $r ]]; then print -r -- $r | sed 's/^/  /'; else print -r -- "  правил нет — сеть открыта"; fi
+  fi
+  print
+  print -r -- "Демон: $(launchctl print system/local.vpnguard >/dev/null 2>&1 && print 'загружен' || print 'НЕ загружен')"
+}
+
+cmd_lock() {
+  need_root
+  mkdir -p $PERM_DIR
+  load_conf
+  local a
+  for a in $APPS[@]; do
+    (( LOCK_LAUNCH )) && lock_app $a
+    case $ON_DOWN in
+      (freeze) freeze_app $a ;;
+      (kill)   kill_app $a ;;
+    esac
+  done
+  pf_apply block
+}
+
+# аварийный выход: вернуть всё как было, даже если конфиг уже изменился
+cmd_unlock() {
+  need_root
+  local sf app m p
+  for sf in $PERM_DIR/*(.N); do
+    app=$(head -1 $sf 2>/dev/null); app=${app#\# app: }
+    while IFS=$'\t' read -r m p; do
+      [[ -z $p || $m == \#* ]] && continue
+      [[ -e $p ]] || continue
+      chmod $m $p 2>/dev/null || print -ru2 -- "не смог вернуть права $m на $p"
+    done < $sf
+    rm -f $sf
+    [[ -n $app ]] && print -r -- "разблокировано: $app"
+  done
+  load_conf >/dev/null 2>&1
+  local a
+  for a in $APPS[@]; do resume_app $a >/dev/null; done
+  pf_off
+  print -r -- "сетевой блок pf снят"
+  print -r -- "готово"
+}
+
+cmd_uninstall() {
+  need_root
+  launchctl bootout system $PLIST 2>/dev/null
+  cmd_unlock
+  rm -f $PLIST
+  rm -rf $STATE_DIR
+  print -r -- "Демон снят и выгружен."
+  print -r -- "Остались (удали вручную, если не нужны): /usr/local/bin/vpn-guard, $CONF"
+}
+
+case ${1:-status} in
+  (daemon)    cmd_daemon ;;
+  (status)    cmd_status ;;
+  (check)     cmd_check ;;
+  (lock)      cmd_lock ;;
+  (unlock)    cmd_unlock ;;
+  (uninstall) cmd_uninstall ;;
+  (*) die "использование: vpn-guard {daemon|status|check|lock|unlock|uninstall}" ;;
+esac

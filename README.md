@@ -105,6 +105,6 @@ powershell -ExecutionPolicy Bypass -File .\uninstall.ps1
 |---|---|
 | `vpn-guard`, `vpn-guard.conf`, `local.vpnguard.plist`, `install.sh` | macOS: демон, настройки, автозапуск, установка |
 | `app/` | macOS: приложение-щит (Swift) и `build.sh` |
-| `make-dmg.sh` | macOS: собрать `VPN-Guard.dmg` |
+| `make-dmg.sh` | macOS: собрать `Vafa.dmg` |
 | `windows/` | Windows: служба, трей, `install.cmd`, `uninstall.ps1` |
 | `INSTALL.md` | подробная установка для обеих систем |

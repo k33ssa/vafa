@@ -79,7 +79,7 @@ notify() {
   [[ -n $uid && $uid != 0 ]] || return 0
   # в фоне: osascript отвечает секундами, а блокировка не должна его ждать
   launchctl asuser $uid osascript \
-    -e "display notification \"$2\" with title \"VPN Guard\" subtitle \"$1\"" >/dev/null 2>&1 &!
+    -e "display notification \"$2\" with title \"Vafa\" subtitle \"$1\"" >/dev/null 2>&1 &!
   return 0
 }
 
@@ -111,7 +111,7 @@ validate_conf() {
   (( ${#VPN_CHECK} )) || { log "VPN_CHECK пуст — беру route"; VPN_CHECK=( route ) }
 }
 
-# Список приложений из мини-приложения (VPN Guard.app). Если файл есть — он главнее
+# Список приложений из мини-приложения (Vafa.app). Если файл есть — он главнее
 # APPS из конфига. Одна строка — один путь к .app. Принимаются только .app в
 # /Applications или ~/Applications, без «..» — демон от root делает chmod по этим
 # путям, так что произвольный путь сюда пускать нельзя.
@@ -456,7 +456,7 @@ pf_mode_when_up() {
   esac
 }
 
-# Состояние для VPN Guard.app: демон пишет его на каждом круге, приложение читает
+# Состояние для Vafa.app: демон пишет его на каждом круге, приложение читает
 # без sudo. Только чтение — управлять демоном через этот файл нельзя.
 json_str() {
   local s=$1

@@ -1,4 +1,4 @@
-﻿# Установка VPN Guard для Windows. Запуск: правый клик по install.cmd → «Запуск
+﻿# Установка Vafa для Windows. Запуск: правый клик по install.cmd → «Запуск
 # от имени администратора» (или install.cmd сам попросит права).
 #requires -RunAsAdministrator
 $ErrorActionPreference = 'Stop'
@@ -42,7 +42,7 @@ Start-ScheduledTask -TaskName VPNGuard
 $trayCmd = 'conhost.exe'
 $trayArg = "--headless powershell.exe -NoProfile -ExecutionPolicy Bypass -File `"$Dest\VPNGuard-Tray.ps1`""
 $sh = New-Object -ComObject WScript.Shell
-$lnk = $sh.CreateShortcut("$env:ProgramData\Microsoft\Windows\Start Menu\Programs\VPN Guard.lnk")
+$lnk = $sh.CreateShortcut("$env:ProgramData\Microsoft\Windows\Start Menu\Programs\Vafa.lnk")
 $lnk.TargetPath = $trayCmd; $lnk.Arguments = $trayArg; $lnk.IconLocation = 'imageres.dll,101'; $lnk.Save()
 
 $user = (Get-CimInstance Win32_ComputerSystem).UserName     # вошедший пользователь, не «администратор UAC»

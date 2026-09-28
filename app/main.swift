@@ -1,4 +1,4 @@
-// VPN Guard.app — значок в строке меню для демона vpn-guard.
+// Vafa.app — значок в строке меню для демона vpn-guard.
 //
 // Состояние берёт из /usr/local/var/vpn-guard/status.json (демон пишет его каждые
 // INTERVAL секунд, читается без sudo). Список приложений записывает в
@@ -71,7 +71,7 @@ final class PickerModel: ObservableObject {
 
     // true — записано. Пароль спрашивает macOS, приложение его не видит.
     func save() -> Bool {
-        let body = "# Пишет VPN Guard.app. Одна строка — один путь к .app.\n"
+        let body = "# Пишет Vafa.app. Одна строка — один путь к .app.\n"
             + selected.sorted().joined(separator: "\n") + "\n"
         let tmp = NSTemporaryDirectory() + "vpn-guard.apps.\(getpid())"
         do { try body.write(toFile: tmp, atomically: true, encoding: .utf8) } catch {
@@ -193,7 +193,7 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
         case let s? where s.vpn: symbol = "checkmark.shield.fill"; tint = .systemGreen
         default: symbol = "xmark.shield.fill"; tint = .systemRed
         }
-        let img = NSImage(systemSymbolName: symbol, accessibilityDescription: "VPN Guard")?
+        let img = NSImage(systemSymbolName: symbol, accessibilityDescription: "Vafa")?
             .withSymbolConfiguration(.init(paletteColors: [tint]))
         item.button?.image = img
         if menu.numberOfItems > 0 { rebuild() }   // меню открыто — обновить на лету
@@ -291,7 +291,7 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
         do {
             if on { try SMAppService.mainApp.register() } else { try SMAppService.mainApp.unregister() }
         } catch {
-            NSLog("VPN Guard: автозапуск: \(error)")
+            NSLog("Vafa: автозапуск: \(error)")
         }
     }
 
@@ -314,7 +314,7 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if window == nil {
             let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 440, height: 520),
                              styleMask: [.titled, .closable, .resizable], backing: .buffered, defer: false)
-            w.title = "VPN Guard"
+            w.title = "Vafa"
             w.isReleasedWhenClosed = false
             w.contentView = NSHostingView(rootView: PickerView(model: picker) { [weak self] in
                 self?.refresh()   // выбор остаётся как сохранили; демон подхватит за ~2 с

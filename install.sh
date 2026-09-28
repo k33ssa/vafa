@@ -14,7 +14,7 @@ for f in vpn-guard vpn-guard.conf local.vpnguard.plist; do
 done
 
 install -d -m 755 -o root -g wheel /usr/local/bin /usr/local/etc /usr/local/var/log
-# сам каталог 755 — в нём status.json для VPN Guard.app; perms/ закрыт
+# сам каталог 755 — в нём status.json для Vafa.app; perms/ закрыт
 install -d -m 755 -o root -g wheel /usr/local/var/vpn-guard
 install -d -m 700 -o root -g wheel /usr/local/var/vpn-guard/perms
 install -m 755 -o root -g wheel $SRC/vpn-guard /usr/local/bin/vpn-guard
@@ -35,17 +35,17 @@ launchctl bootstrap system $PLIST
 launchctl enable system/local.vpnguard 2>/dev/null || true
 
 # мини-приложение в строке меню (собирается ./app/build.sh)
-if [[ -d "$SRC/app/VPN Guard.app" ]]; then
-  rm -rf "/Applications/VPN Guard.app"
-  cp -R "$SRC/app/VPN Guard.app" /Applications/
+if [[ -d "$SRC/app/Vafa.app" ]]; then
+  rm -rf "/Applications/Vafa.app" "/Applications/VPN Guard.app"   # старое имя
+  cp -R "$SRC/app/Vafa.app" /Applications/
   # скачанное из интернета помечено карантином — иначе Gatekeeper не откроет
-  xattr -dr com.apple.quarantine "/Applications/VPN Guard.app" 2>/dev/null || true
-  print -r -- "Приложение: /Applications/VPN Guard.app"
+  xattr -dr com.apple.quarantine "/Applications/Vafa.app" 2>/dev/null || true
+  print -r -- "Приложение: /Applications/Vafa.app"
   # сразу запустить у вошедшего пользователя — щит появится в строке меню
   cu=$(stat -f '%Su' /dev/console 2>/dev/null)
   if [[ -n $cu && $cu != root ]]; then
     pkill -x VPNGuard 2>/dev/null || true
-    launchctl asuser $(id -u $cu) sudo -u $cu open "/Applications/VPN Guard.app" || true
+    launchctl asuser $(id -u $cu) sudo -u $cu open "/Applications/Vafa.app" || true
   fi
 fi
 

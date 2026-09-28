@@ -80,7 +80,7 @@ function Show-Picker {
     $current = @(); if ($s) { $current = @($s.apps | ForEach-Object path) }
 
     $f = New-Object Windows.Forms.Form
-    $f.Text = 'VPN Guard'; $f.Size = New-Object Drawing.Size 520, 640; $f.StartPosition = 'CenterScreen'
+    $f.Text = 'Vafa'; $f.Size = New-Object Drawing.Size 520, 640; $f.StartPosition = 'CenterScreen'
     $f.Font = New-Object Drawing.Font 'Segoe UI', 10
 
     $status = New-Object Windows.Forms.Label
@@ -200,9 +200,9 @@ $ni.Add_DoubleClick({ Show-Picker })
 
 $refresh = {
     $s = Read-Status
-    if (-not (Guard-On) -or (Is-Stale $s) -or -not @($s.apps).Count) { $ni.Icon = $IconOff; $ni.Text = 'VPN Guard: охрана выключена' }
-    elseif ($s.vpn) { $ni.Icon = $IconUp; $ni.Text = 'VPN Guard: VPN поднят' }
-    else { $ni.Icon = $IconDown; $ni.Text = 'VPN Guard: блокировка' }
+    if (-not (Guard-On) -or (Is-Stale $s) -or -not @($s.apps).Count) { $ni.Icon = $IconOff; $ni.Text = 'Vafa: охрана выключена' }
+    elseif ($s.vpn) { $ni.Icon = $IconUp; $ni.Text = 'Vafa: VPN поднят' }
+    else { $ni.Icon = $IconDown; $ni.Text = 'Vafa: блокировка' }
 }
 & $refresh
 Rebuild-Menu

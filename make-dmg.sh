@@ -1,14 +1,14 @@
 #!/bin/zsh
-# Собирает VPN-Guard.dmg для установки на другом Маке. Запуск: ./make-dmg.sh
+# Собирает Vafa.dmg для установки на другом Маке. Запуск: ./make-dmg.sh
 emulate -L zsh
 set -eu
 cd ${0:A:h}
 ./app/build.sh
-STAGE=$(mktemp -d)/"VPN Guard"
+STAGE=$(mktemp -d)/"Vafa"
 mkdir -p "$STAGE/app"
 cp vpn-guard vpn-guard.conf local.vpnguard.plist install.sh INSTALL.md "$STAGE/"
-cp -R "app/VPN Guard.app" "$STAGE/app/"
-rm -f VPN-Guard.dmg
-hdiutil create -quiet -volname "VPN Guard" -srcfolder "$STAGE" -format UDZO VPN-Guard.dmg
+cp -R "app/Vafa.app" "$STAGE/app/"
+rm -f Vafa.dmg
+hdiutil create -quiet -volname "Vafa" -srcfolder "$STAGE" -format UDZO Vafa.dmg
 rm -rf "${STAGE:h}"
-print -r -- "готово: $PWD/VPN-Guard.dmg"
+print -r -- "готово: $PWD/Vafa.dmg"

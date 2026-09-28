@@ -9,7 +9,7 @@
 
 ---
 
-## 🍎 macOS
+##  macOS
 
 ### Установка
 
@@ -51,7 +51,7 @@ sudo vpn-guard uninstall   # удалить демон
 
 ---
 
-## 🪟 Windows 10/11
+##  Windows 10/11
 
 ### Установка
 
@@ -92,9 +92,9 @@ powershell -ExecutionPolicy Bypass -File .\uninstall.ps1
 Проверка по умолчанию на обеих системах: **весь трафик идёт через туннель** и
 **Cloudflare видит выход не из России**.
 
-* ✅ Подходит любой VPN в режиме туннеля: Happ, OpenVPN, WireGuard, Outline,
+*  Подходит любой VPN в режиме туннеля: Happ, OpenVPN, WireGuard, Outline,
   AmneziaVPN, встроенный IKEv2 и т.п.
-* ❌ Не подходит «как есть» VPN в режиме **системного прокси** (Happ/V2Ray/Clash)
+*  Не подходит «как есть» VPN в режиме **системного прокси** (Happ/V2Ray/Clash)
   или с раздельным туннелированием — трафик идёт мимо туннеля, и охрана считает,
   что VPN нет. Для таких случаев есть правила `proc:`, `nc:`/`adapter:`, `script:` —
   см. [docs/ПОДРОБНО.md](docs/ПОДРОБНО.md).

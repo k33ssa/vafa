@@ -182,8 +182,11 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func refresh() {
         last = readStatus()
         picker.status = last
+        // охрана выключена — сразу пустой контур, не ждать, пока status.json устареет
+        let on = guardOn()
         let symbol: String, tint: NSColor
         switch last {
+        case _ where !on: symbol = "shield"; tint = .systemGreen
         // охрана выключена (демон не работает) или сторожить нечего — пустой контур
         case nil: symbol = "shield"; tint = .systemGreen
         case let s? where isStale(s) || s.apps.isEmpty: symbol = "shield"; tint = .systemGreen
@@ -210,7 +213,9 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func rebuild() {
         menu.removeAllItems()
         if let s = last {
-            if isStale(s) {
+            if !guardOn() {
+                info("Охрана выключена", bold: true, color: .secondaryLabelColor)
+            } else if isStale(s) {
                 info("Демон не отвечает", bold: true, color: .systemOrange)
                 info("последнее обновление: \(Int(Date().timeIntervalSince1970 - s.time)) с назад")
             } else {

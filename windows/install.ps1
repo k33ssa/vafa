@@ -7,7 +7,7 @@ $Dest = Join-Path $env:ProgramFiles 'VPNGuard'
 $Root = Join-Path $env:ProgramData 'VPNGuard'
 
 New-Item -ItemType Directory -Force -Path $Dest, $Root | Out-Null
-Copy-Item "$Src\vpn-guard.ps1", "$Src\VPNGuard-Tray.ps1" $Dest -Force
+Copy-Item "$Src\vpn-guard.ps1", "$Src\VPNGuard-Tray.ps1", "$Src\vafa.ico" $Dest -Force
 Get-ChildItem $Dest -File | ForEach-Object { $_.IsReadOnly = $false }
 
 # ProgramData\VPNGuard: писать могут только SYSTEM и администраторы, читать — все
@@ -43,7 +43,7 @@ $trayCmd = 'conhost.exe'
 $trayArg = "--headless powershell.exe -NoProfile -ExecutionPolicy Bypass -File `"$Dest\VPNGuard-Tray.ps1`""
 $sh = New-Object -ComObject WScript.Shell
 $lnk = $sh.CreateShortcut("$env:ProgramData\Microsoft\Windows\Start Menu\Programs\Vafa.lnk")
-$lnk.TargetPath = $trayCmd; $lnk.Arguments = $trayArg; $lnk.IconLocation = 'imageres.dll,101'; $lnk.Save()
+$lnk.TargetPath = $trayCmd; $lnk.Arguments = $trayArg; $lnk.IconLocation = "$Dest\vafa.ico"; $lnk.Save()
 
 $user = (Get-CimInstance Win32_ComputerSystem).UserName     # вошедший пользователь, не «администратор UAC»
 if ($user) {

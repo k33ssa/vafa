@@ -1,5 +1,21 @@
 # VPN Guard
 
+# Quick install 
+
+```bash
+git clone https://github.com/k33ssa/vafa
+cd vafa
+./app/build.sh
+sudo ./install.sh
+```
+
+Проверить:
+
+```bash
+sudo vpn-guard status
+```
+# О приложении 
+
 Не даёт пользоваться выбранными приложениями на macOS, пока не включён VPN.
 
 Системный демон (root) каждые 2 секунды проверяет VPN. Если VPN нет:

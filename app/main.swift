@@ -46,6 +46,7 @@ final class PickerModel: ObservableObject {
     @Published var selected: Set<String> = []
     @Published var filter = ""
     @Published var error: String?
+    @Published var status: GuardStatus?
 
     func load(current: [String]) {
         let fm = FileManager.default
@@ -96,6 +97,8 @@ struct PickerView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
+            StatusView(status: model.status)
+            Divider()
             Text("Приложения, которые блокируются без VPN").font(.headline)
             TextField("Поиск", text: $model.filter).textFieldStyle(.roundedBorder)
             List(model.visible) { item in
@@ -116,12 +119,34 @@ struct PickerView: View {
             HStack {
                 Text("Выбрано: \(model.selected.count)").foregroundColor(.secondary)
                 Spacer()
-                Button("Отмена", action: onClose).keyboardShortcut(.cancelAction)
                 Button("Сохранить") { if model.save() { onClose() } }.keyboardShortcut(.defaultAction)
             }
         }
         .padding(16)
-        .frame(minWidth: 420, minHeight: 480)
+        .frame(minWidth: 460, minHeight: 600)
+    }
+}
+
+struct StatusView: View {
+    let status: GuardStatus?
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            if let s = status {
+                let stale = Date().timeIntervalSince1970 - s.time > 20
+                Text(stale ? "Демон не отвечает" : (s.vpn ? "VPN: поднят" : "VPN: ВЫКЛЮЧЕН — блокировка"))
+                    .font(.title2.bold())
+                    .foregroundColor(stale ? .orange : (s.vpn ? .green : .red))
+                Text("маршрут: \(s.iface.isEmpty ? "—" : s.iface), страна: \(s.country.isEmpty ? "нет ответа" : s.country)")
+                    .foregroundColor(.secondary)
+                ForEach(s.apps, id: \.path) { a in
+                    Text("\(appName(a.path)) — запуск: \(a.locked ? "ЗАБЛОКИРОВАНО" : "разблокировано"), процессов: \(a.procs)"
+                         + (a.frozen > 0 ? ", заморожено: \(a.frozen)" : ""))
+                        .foregroundColor(a.frozen > 0 ? .red : .primary)
+                }
+            } else {
+                Text("Нет данных от демона").font(.title2.bold()).foregroundColor(.orange)
+            }
+        }
     }
 }
 
@@ -139,12 +164,18 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
         item.menu = menu
         refresh()
         Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in self?.refresh() }
+        openPicker()
+    }
+
+    func applicationShouldHandleReopen(_ s: NSApplication, hasVisibleWindows: Bool) -> Bool {
+        openPicker(); return true
     }
 
     func isStale(_ s: GuardStatus) -> Bool { Date().timeIntervalSince1970 - s.time > 20 }
 
     func refresh() {
         last = readStatus()
+        picker.status = last
         let symbol: String, tint: NSColor
         switch last {
         case nil: symbol = "exclamationmark.shield"; tint = .systemOrange
@@ -215,8 +246,7 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
             w.title = "VPN Guard"
             w.isReleasedWhenClosed = false
             w.contentView = NSHostingView(rootView: PickerView(model: picker) { [weak self] in
-                self?.window?.close()
-                self?.refresh()
+                self?.refresh()   // выбор остаётся как сохранили; демон подхватит за ~2 с
             })
             w.center()
             window = w
@@ -229,5 +259,5 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
 let app = NSApplication.shared
 let controller = Controller()
 app.delegate = controller
-app.setActivationPolicy(.accessory)
+app.setActivationPolicy(.regular)
 app.run()

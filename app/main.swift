@@ -9,6 +9,7 @@
 
 import AppKit
 import SwiftUI
+import ServiceManagement
 
 let statusPath = "/usr/local/var/vpn-guard/status.json"
 let appsFilePath = "/usr/local/etc/vpn-guard.apps"
@@ -164,7 +165,12 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
         item.menu = menu
         refresh()
         Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in self?.refresh() }
-        openPicker()
+        // первый запуск — сразу включить автозапуск при входе; дальше решает пользователь
+        let d = UserDefaults.standard
+        if !d.bool(forKey: "loginItemAsked") {
+            d.set(true, forKey: "loginItemAsked")
+            setLoginItem(true)
+        }
     }
 
     func applicationShouldHandleReopen(_ s: NSApplication, hasVisibleWindows: Bool) -> Bool {
@@ -178,8 +184,9 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
         picker.status = last
         let symbol: String, tint: NSColor
         switch last {
-        case nil: symbol = "exclamationmark.shield"; tint = .systemOrange
-        case let s? where isStale(s): symbol = "exclamationmark.shield"; tint = .systemOrange
+        // охрана выключена (демон не работает) или сторожить нечего — пустой контур
+        case nil: symbol = "shield"; tint = .systemGreen
+        case let s? where isStale(s) || s.apps.isEmpty: symbol = "shield"; tint = .systemGreen
         case let s? where s.vpn: symbol = "checkmark.shield.fill"; tint = .systemGreen
         default: symbol = "xmark.shield.fill"; tint = .systemRed
         }
@@ -231,7 +238,66 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let log = NSMenuItem(title: "Открыть журнал", action: #selector(openLog), keyEquivalent: "")
         log.target = self
         menu.addItem(log)
+        menu.addItem(.separator())
+        let on = guardOn()
+        let g = NSMenuItem(title: "Охрана включена", action: #selector(toggleGuard), keyEquivalent: "")
+        g.state = on ? .on : .off
+        g.target = self
+        menu.addItem(g)
+        let li = NSMenuItem(title: "Запускать при входе в систему", action: #selector(toggleLogin), keyEquivalent: "")
+        li.state = loginItemOn() ? .on : .off
+        li.target = self
+        menu.addItem(li)
+        menu.addItem(.separator())
         menu.addItem(NSMenuItem(title: "Выйти", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
+    }
+
+    // Демон загружен? launchctl print system/... без root работает.
+    func guardOn() -> Bool {
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/bin/launchctl")
+        p.arguments = ["print", "system/local.vpnguard"]
+        p.standardOutput = FileHandle.nullDevice
+        p.standardError = FileHandle.nullDevice
+        do { try p.run() } catch { return false }
+        p.waitUntilExit()
+        return p.terminationStatus == 0
+    }
+
+    // Выключение = выгрузить демон, запретить ему стартовать и снять всю блокировку.
+    // Включение — наоборот. Оба через пароль администратора.
+    @objc func toggleGuard() {
+        let plist = "/Library/LaunchDaemons/local.vpnguard.plist"
+        let cmd = guardOn()
+            ? "launchctl bootout system \(plist); launchctl disable system/local.vpnguard; /usr/local/bin/vpn-guard unlock"
+            : "launchctl enable system/local.vpnguard; launchctl bootstrap system \(plist)"
+        var err: NSDictionary?
+        NSAppleScript(source: "do shell script \"\(cmd)\" with administrator privileges")?.executeAndReturnError(&err)
+        refresh()
+    }
+
+    func loginItemOn() -> Bool {
+        if #available(macOS 13.0, *) { return SMAppService.mainApp.status == .enabled }
+        return false
+    }
+
+    func setLoginItem(_ on: Bool) {
+        guard #available(macOS 13.0, *) else { return }
+        do {
+            if on { try SMAppService.mainApp.register() } else { try SMAppService.mainApp.unregister() }
+        } catch {
+            NSLog("VPN Guard: автозапуск: \(error)")
+        }
+    }
+
+    @objc func toggleLogin() {
+        guard #available(macOS 13.0, *) else {
+            let a = NSAlert()
+            a.messageText = "На macOS 12 автозапуск включается вручную: Системные настройки → Пользователи → Объекты входа."
+            a.runModal()
+            return
+        }
+        setLoginItem(!loginItemOn())
     }
 
     @objc func openLog() {
@@ -259,5 +325,5 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
 let app = NSApplication.shared
 let controller = Controller()
 app.delegate = controller
-app.setActivationPolicy(.regular)
+app.setActivationPolicy(.accessory)   // только значок в строке меню, без Dock
 app.run()

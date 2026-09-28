@@ -200,7 +200,7 @@ $ni.Add_DoubleClick({ Show-Picker })
 
 $refresh = {
     $s = Read-Status
-    if ((Is-Stale $s) -or -not @($s.apps).Count) { $ni.Icon = $IconOff; $ni.Text = 'VPN Guard: охрана выключена' }
+    if (-not (Guard-On) -or (Is-Stale $s) -or -not @($s.apps).Count) { $ni.Icon = $IconOff; $ni.Text = 'VPN Guard: охрана выключена' }
     elseif ($s.vpn) { $ni.Icon = $IconUp; $ni.Text = 'VPN Guard: VPN поднят' }
     else { $ni.Icon = $IconDown; $ni.Text = 'VPN Guard: блокировка' }
 }

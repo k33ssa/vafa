@@ -1,0 +1,12 @@
+{
+  "apps": [],
+  "checks": ["route", "geo:!RU"],
+  "require": "all",
+  "on_down": "freeze",
+  "lock_launch": true,
+  "block_nets": [],
+  "interval": 2,
+  "geo_ttl": 15,
+  "geo_stale": 60,
+  "grace": 0
+}

@@ -31,6 +31,25 @@ sudo vpn-guard status
 (`Claude — запуск: разблокировано, процессов: 20`) и галочки «какие приложения
 охранять».
 
+## Быстрая установка
+
+**macOS** (нужны Xcode Command Line Tools: `xcode-select --install`):
+
+```bash
+cd ~
+git clone https://github.com/k33ssa/vafa
+cd vafa
+./app/build.sh
+sudo ./install.sh
+```
+
+Щит сразу появится в строке меню. Проверить: `sudo vpn-guard status`.
+
+**Windows 10/11**: скачать репозиторий (Code → Download ZIP), распаковать, открыть
+папку `windows` и дважды щёлкнуть `install.cmd` — он сам попросит права
+администратора. Щит появится в трее (возможно, под стрелкой ^ у часов).
+Подробнее — [INSTALL.md](INSTALL.md).
+
 ## Как понимается, что VPN включён
 
 Правила в `/usr/local/etc/vpn-guard.conf`, по умолчанию оба сразу:
@@ -56,5 +75,6 @@ Wi-Fi, и демон считает, что VPN нет. Для таких слу
 | `install.sh` | установка — см. [INSTALL.md](INSTALL.md) |
 | `app/` | исходник VPN Guard.app и `build.sh` |
 | `make-dmg.sh` | собрать `VPN-Guard.dmg` для другого Мака |
+| `windows/` | версия для Windows: служба (PowerShell + Планировщик), трей, `install.cmd` |
 
 Аварийно снять всю блокировку: `sudo vpn-guard unlock`.

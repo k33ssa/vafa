@@ -41,6 +41,12 @@ if [[ -d "$SRC/app/VPN Guard.app" ]]; then
   # скачанное из интернета помечено карантином — иначе Gatekeeper не откроет
   xattr -dr com.apple.quarantine "/Applications/VPN Guard.app" 2>/dev/null || true
   print -r -- "Приложение: /Applications/VPN Guard.app"
+  # сразу запустить у вошедшего пользователя — щит появится в строке меню
+  cu=$(stat -f '%Su' /dev/console 2>/dev/null)
+  if [[ -n $cu && $cu != root ]]; then
+    pkill -x VPNGuard 2>/dev/null || true
+    launchctl asuser $(id -u $cu) sudo -u $cu open "/Applications/VPN Guard.app" || true
+  fi
 fi
 
 print -r -- ""

@@ -5,7 +5,8 @@ set -eu
 cd ${0:A:h}
 APP="Vafa.app"
 rm -rf $APP
-mkdir -p $APP/Contents/MacOS
+mkdir -p $APP/Contents/MacOS $APP/Contents/Resources
+cp Vafa.icns $APP/Contents/Resources/Vafa.icns   # иконка из assets/logo.png
 # универсальный бинарь: работает и на Apple Silicon, и на Intel
 swiftc -O -target arm64-apple-macos12 -o /tmp/vpnguard-arm64.$$ main.swift
 swiftc -O -target x86_64-apple-macos12 -o /tmp/vpnguard-x86.$$ main.swift
@@ -17,6 +18,7 @@ cat > $APP/Contents/Info.plist <<'EOF'
 <plist version="1.0"><dict>
   <key>CFBundleName</key><string>Vafa</string>
   <key>CFBundleIdentifier</key><string>local.vafa.menu</string>
+  <key>CFBundleIconFile</key><string>Vafa</string>
   <key>CFBundleExecutable</key><string>VPNGuard</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>CFBundleShortVersionString</key><string>1.0</string>

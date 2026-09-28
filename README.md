@@ -1,3 +1,5 @@
+<p align="center"><img src="assets/logo.png" width="280" alt="Vafa"></p>
+
 # Vafa (Verify access for apps) 
 
 Не даёт пользоваться выбранными приложениями, пока не включён VPN.

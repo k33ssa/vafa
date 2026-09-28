@@ -82,6 +82,7 @@ function Show-Picker {
     $f = New-Object Windows.Forms.Form
     $f.Text = 'Vafa'; $f.Size = New-Object Drawing.Size 520, 640; $f.StartPosition = 'CenterScreen'
     $f.Font = New-Object Drawing.Font 'Segoe UI', 10
+    $ico = Join-Path $PSScriptRoot 'vafa.ico'; if (Test-Path $ico) { $f.Icon = New-Object Drawing.Icon $ico }
 
     $status = New-Object Windows.Forms.Label
     $status.Dock = 'Top'; $status.Height = 110; $status.Padding = New-Object Windows.Forms.Padding 10

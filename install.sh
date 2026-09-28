@@ -38,6 +38,8 @@ launchctl enable system/local.vpnguard 2>/dev/null || true
 if [[ -d "$SRC/app/VPN Guard.app" ]]; then
   rm -rf "/Applications/VPN Guard.app"
   cp -R "$SRC/app/VPN Guard.app" /Applications/
+  # скачанное из интернета помечено карантином — иначе Gatekeeper не откроет
+  xattr -dr com.apple.quarantine "/Applications/VPN Guard.app" 2>/dev/null || true
   print -r -- "Приложение: /Applications/VPN Guard.app"
 fi
 

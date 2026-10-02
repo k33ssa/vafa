@@ -135,6 +135,7 @@ function Show-Picker {
         if (Is-Stale $s) { $status.Text = "Охрана выключена`n(служба не работает)"; $status.ForeColor = 'DarkOrange'; return }
         $t = if ($s.vpn) { 'VPN: поднят' } else { 'VPN: ВЫКЛЮЧЕН — блокировка' }
         $t += "`nинтерфейс: $($s.iface), страна: $(if ($s.country) { $s.country } else { 'нет ответа' })"
+        if (@($s.countries).Count) { $t += "; блокировать из: $(@($s.countries) -join ', ')" }
         foreach ($a in $s.apps) {
             $t += "`n$(App-Name $a.path) — запуск: $(if ($a.locked) { 'ЗАБЛОКИРОВАНО' } else { 'разблокировано' }), процессов: $($a.procs)"
             if ($a.frozen) { $t += ", заморожено: $($a.frozen)" }
@@ -144,6 +145,92 @@ function Show-Picker {
     & $upd
     $tm = New-Object Windows.Forms.Timer; $tm.Interval = 2000; $tm.Add_Tick($upd); $tm.Start()
     $f.Add_FormClosed({ $tm.Stop() })
+    [void]$f.ShowDialog()
+}
+
+# ---- окно выбора стран --------------------------------------------------------
+$DefaultCountries = @('RU', 'CN', 'BY', 'IR')
+
+# Все страны, какие знает Windows: код ISO и название на языке системы
+function Get-Countries {
+    $seen = @{}
+    foreach ($c in [Globalization.CultureInfo]::GetCultures([Globalization.CultureTypes]::SpecificCultures)) {
+        try { $r = New-Object Globalization.RegionInfo $c.Name } catch { continue }
+        $code = $r.TwoLetterISORegionName
+        if ($code -match '^[A-Z]{2}$' -and -not $seen.ContainsKey($code)) {
+            $seen[$code] = 1
+            [pscustomobject]@{ Code = $code; Name = $r.DisplayName }
+        }
+    }
+}
+
+function Show-Countries {
+    $s = Read-Status
+    $cur = if ($s -and $null -ne $s.countries) { @($s.countries) } else { $DefaultCountries }
+    $st = @{ Sel = @{}; Busy = $false }
+    foreach ($c in $cur) { $st.Sel["$c"] = $true }
+    $all = @(Get-Countries)
+    foreach ($c in $cur) { if (-not ($all | Where-Object Code -eq $c)) { $all += [pscustomobject]@{ Code = "$c"; Name = "$c" } } }
+    $all = @($all | Sort-Object Name)
+
+    $f = New-Object Windows.Forms.Form
+    $f.Text = 'Vafa — страны'; $f.Size = New-Object Drawing.Size 460, 620; $f.StartPosition = 'CenterScreen'
+    $f.Font = New-Object Drawing.Font 'Segoe UI', 10
+    $ico = Join-Path $PSScriptRoot 'vafa.ico'; if (Test-Path $ico) { $f.Icon = New-Object Drawing.Icon $ico }
+
+    $hdr = New-Object Windows.Forms.Label
+    $hdr.Dock = 'Top'; $hdr.Height = 64; $hdr.Padding = New-Object Windows.Forms.Padding 10, 6, 10, 0
+    $hdr.Text = "Страны, из которых VPN считается выключенным.`nЕсли интернет видит тебя из отмеченной страны — приложения блокируются."
+    if ($s -and $s.geo -eq $false) { $hdr.Text += "`nПроверка страны выключена в config.json: добавь geo в checks."; $hdr.ForeColor = 'DarkOrange' }
+
+    $search = New-Object Windows.Forms.TextBox
+    $search.Dock = 'Top'
+
+    $list = New-Object Windows.Forms.CheckedListBox
+    $list.Dock = 'Fill'; $list.CheckOnClick = $true; $list.IntegralHeight = $false
+    $shown = New-Object Collections.ArrayList
+
+    $bottom = New-Object Windows.Forms.FlowLayoutPanel
+    $bottom.Dock = 'Bottom'; $bottom.Height = 44; $bottom.FlowDirection = 'RightToLeft'; $bottom.Padding = New-Object Windows.Forms.Padding 6
+    $save = New-Object Windows.Forms.Button; $save.Text = 'Сохранить'; $save.Width = 120
+    $def  = New-Object Windows.Forms.Button; $def.Text = 'По умолчанию'; $def.Width = 130
+    $count = New-Object Windows.Forms.Label; $count.AutoSize = $true; $count.Padding = New-Object Windows.Forms.Padding 0, 8, 0, 0
+    $bottom.Controls.AddRange(@($save, $def, $count))
+
+    $f.Controls.Add($list); $f.Controls.Add($search); $f.Controls.Add($hdr); $f.Controls.Add($bottom)
+    $list.BringToFront()
+
+    # выбранные — сверху; поиск по названию или коду
+    $fill = {
+        $st.Busy = $true
+        $list.BeginUpdate(); $list.Items.Clear(); $shown.Clear()
+        $q = $search.Text.Trim()
+        $match = @($all | Where-Object { -not $q -or $_.Name -like "*$q*" -or $_.Code -eq $q })
+        foreach ($c in (@($match | Where-Object { $st.Sel[$_.Code] }) + @($match | Where-Object { -not $st.Sel[$_.Code] }))) {
+            [void]$shown.Add($c)
+            $i = $list.Items.Add("$($c.Name)   $($c.Code)")
+            if ($st.Sel[$c.Code]) { $list.SetItemChecked($i, $true) }
+        }
+        $list.EndUpdate()
+        $count.Text = "Выбрано: $($st.Sel.Count)"
+        $st.Busy = $false
+    }
+    $list.Add_ItemCheck({
+        param($sender, $e)
+        if ($st.Busy) { return }
+        $code = $shown[$e.Index].Code
+        if ($e.NewValue -eq 'Checked') { $st.Sel[$code] = $true } else { $st.Sel.Remove($code) }
+        $count.Text = "Выбрано: $($st.Sel.Count)"
+    })
+    $search.Add_TextChanged($fill)
+    $def.Add_Click({ $st.Sel.Clear(); foreach ($c in $DefaultCountries) { $st.Sel[$c] = $true }; & $fill })
+    $save.Add_Click({
+        $tmp = Join-Path $env:TEMP "vpnguard-countries-$PID.json"
+        ConvertTo-Json -InputObject @($st.Sel.Keys | Sort-Object) | Set-Content $tmp -Encoding UTF8
+        if (Run-Elevated "& '$Daemon' set-countries '$tmp'") { $f.Close() }
+        Remove-Item $tmp -ErrorAction SilentlyContinue
+    })
+    & $fill
     [void]$f.ShowDialog()
 }
 
@@ -182,6 +269,10 @@ function Rebuild-Menu {
     else {
         [void]$menu.Items.Add($(if ($s.vpn) { 'VPN: поднят' } else { 'VPN: ВЫКЛЮЧЕН — блокировка' }))
         [void]$menu.Items.Add("интерфейс: $($s.iface), страна: $(if ($s.country) { $s.country } else { 'нет ответа' })")
+        if ($null -ne $s.countries) {
+            [void]$menu.Items.Add($(if ($s.geo -eq $false) { 'проверка страны выключена в конфиге' }
+                elseif (@($s.countries).Count) { "блокировать из: $(@($s.countries) -join ', ')" } else { 'страны блокировки не выбраны' }))
+        }
         foreach ($a in $s.apps) {
             $l = "$(App-Name $a.path) — запуск: $(if ($a.locked) { 'ЗАБЛОКИРОВАНО' } else { 'разблокировано' }), процессов: $($a.procs)"
             if ($a.frozen) { $l += ", заморожено: $($a.frozen)" }
@@ -191,6 +282,7 @@ function Rebuild-Menu {
     foreach ($i in $menu.Items) { $i.Enabled = $false }
     [void]$menu.Items.Add('-')
     $menu.Items.Add('Выбрать приложения…').Add_Click({ Show-Picker })
+    $menu.Items.Add('Выбрать страны…').Add_Click({ Show-Countries })
 
     $g = New-Object Windows.Forms.ToolStripMenuItem 'Охрана включена'
     $g.Checked = Guard-On

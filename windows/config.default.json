@@ -1,12 +1,15 @@
 {
   "apps": [],
-  "checks": ["route", "geo:!RU"],
+  "checks": ["route", "geo"],
+  "block_countries": ["RU", "CN", "BY", "IR"],
   "require": "all",
   "on_down": "freeze",
   "lock_launch": true,
   "block_nets": [],
-  "interval": 2,
-  "geo_ttl": 15,
+  "interval": 1,
+  "geo_ttl": 1,
+  "geo_ttl_down": 1,
+  "net_watch": true,
   "geo_stale": 60,
   "grace": 0
 }

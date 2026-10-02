@@ -13,6 +13,8 @@ import ServiceManagement
 
 let statusPath = "/usr/local/var/vpn-guard/status.json"
 let appsFilePath = "/usr/local/etc/vpn-guard.apps"
+let countriesFilePath = "/usr/local/etc/vpn-guard.countries"
+let defaultCountries = ["RU", "CN", "BY", "IR"]
 
 struct AppState: Decodable {
     let path: String
@@ -28,6 +30,9 @@ struct GuardStatus: Decodable {
     let country: String
     let on_down: String
     let apps: [AppState]
+    // nil — старый демон, который о странах ещё не знает
+    let countries: [String]?
+    let geo: Bool?
 }
 
 func readStatus() -> GuardStatus? {
@@ -37,6 +42,35 @@ func readStatus() -> GuardStatus? {
 
 func appName(_ path: String) -> String {
     ((path as NSString).lastPathComponent as NSString).deletingPathExtension
+}
+
+// Записать файл в /usr/local/etc от root. Пароль спрашивает macOS, приложение его
+// не видит. nil — записано; "" — нажали «Отменить»; иначе текст ошибки.
+func installAsRoot(_ body: String, to dest: String) -> String? {
+    let tmp = NSTemporaryDirectory() + "vafa.\(getpid()).\((dest as NSString).lastPathComponent)"
+    do { try body.write(toFile: tmp, atomically: true, encoding: .utf8) } catch {
+        return "Не смог записать временный файл: \(error.localizedDescription)"
+    }
+    defer { try? FileManager.default.removeItem(atPath: tmp) }
+    let q = { (s: String) in "'" + s.replacingOccurrences(of: "'", with: "'\\''") + "'" }
+    let cmd = "/usr/bin/install -m 644 -o root -g wheel \(q(tmp)) \(q(dest))"
+    let script = "do shell script \"\(cmd.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\""))\" with administrator privileges"
+    var err: NSDictionary?
+    NSAppleScript(source: script)?.executeAndReturnError(&err)
+    if let err = err {
+        if (err[NSAppleScript.errorNumber] as? Int) == -128 { return "" }   // нажали «Отменить»
+        return (err[NSAppleScript.errorMessage] as? String) ?? "ошибка записи"
+    }
+    return nil
+}
+
+func flag(_ code: String) -> String {
+    String(String.UnicodeScalarView(code.unicodeScalars.compactMap { Unicode.Scalar(127397 + $0.value) }))
+}
+
+let ruLocale = Locale(identifier: "ru_RU")
+func countryName(_ code: String) -> String {
+    ruLocale.localizedString(forRegionCode: code) ?? code
 }
 
 // MARK: - выбор приложений
@@ -73,22 +107,90 @@ final class PickerModel: ObservableObject {
     func save() -> Bool {
         let body = "# Пишет Vafa.app. Одна строка — один путь к .app.\n"
             + selected.sorted().joined(separator: "\n") + "\n"
-        let tmp = NSTemporaryDirectory() + "vpn-guard.apps.\(getpid())"
-        do { try body.write(toFile: tmp, atomically: true, encoding: .utf8) } catch {
-            self.error = "Не смог записать временный файл: \(error.localizedDescription)"; return false
+        guard let e = installAsRoot(body, to: appsFilePath) else { return true }
+        if !e.isEmpty { error = e }
+        return false
+    }
+}
+
+// MARK: - выбор стран
+
+final class CountryModel: ObservableObject {
+    struct Item: Identifiable { let id: String; let name: String }
+    @Published var items: [Item] = []
+    @Published var selected: Set<String> = []
+    @Published var filter = ""
+    @Published var error: String?
+    var geoOn = true
+
+    func load(current: [String], geoOn: Bool) {
+        self.geoOn = geoOn
+        let codes = Set(Locale.isoRegionCodes.filter { $0.count == 2 && Int($0) == nil }).union(current)
+        items = codes.map { Item(id: $0, name: countryName($0)) }
+            .sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+        selected = Set(current)
+        filter = ""
+        error = nil
+    }
+
+    // выбранные — сверху, чтобы было видно, что сейчас блокируется
+    var visible: [Item] {
+        let f = filter.trimmingCharacters(in: .whitespaces)
+        let list = f.isEmpty ? items : items.filter {
+            $0.name.localizedCaseInsensitiveContains(f) || $0.id.caseInsensitiveCompare(f) == .orderedSame
         }
-        defer { try? FileManager.default.removeItem(atPath: tmp) }
-        let q = { (s: String) in "'" + s.replacingOccurrences(of: "'", with: "'\\''") + "'" }
-        let cmd = "/usr/bin/install -m 644 -o root -g wheel \(q(tmp)) \(q(appsFilePath))"
-        let script = "do shell script \"\(cmd.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\""))\" with administrator privileges"
-        var err: NSDictionary?
-        NSAppleScript(source: script)?.executeAndReturnError(&err)
-        if let err = err {
-            if (err[NSAppleScript.errorNumber] as? Int) == -128 { return false }   // нажали «Отменить»
-            self.error = (err[NSAppleScript.errorMessage] as? String) ?? "ошибка записи"
-            return false
+        return list.filter { selected.contains($0.id) } + list.filter { !selected.contains($0.id) }
+    }
+
+    func save() -> Bool {
+        let body = "# Пишет Vafa.app. Одна строка — один код страны (ISO, две буквы).\n"
+            + selected.sorted().joined(separator: "\n") + "\n"
+        guard let e = installAsRoot(body, to: countriesFilePath) else { return true }
+        if !e.isEmpty { error = e }
+        return false
+    }
+}
+
+struct CountryView: View {
+    @ObservedObject var model: CountryModel
+    var onClose: () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("Страны, из которых VPN считается выключенным").font(.headline)
+            Text("Если интернет видит тебя из отмеченной страны — приложения блокируются, даже когда туннель поднят.")
+                .font(.caption).foregroundColor(.secondary).fixedSize(horizontal: false, vertical: true)
+            if !model.geoOn {
+                Text("Проверка страны выключена в /usr/local/etc/vpn-guard.conf: добавь geo в VPN_CHECK.")
+                    .font(.caption).foregroundColor(.orange).fixedSize(horizontal: false, vertical: true)
+            }
+            TextField("Поиск: название или код (CN)", text: $model.filter).textFieldStyle(.roundedBorder)
+            List(model.visible) { item in
+                Toggle(isOn: Binding(
+                    get: { model.selected.contains(item.id) },
+                    set: { on in if on { model.selected.insert(item.id) } else { model.selected.remove(item.id) } }
+                )) {
+                    HStack {
+                        Text(flag(item.id))
+                        Text(item.name)
+                        Text(item.id).foregroundColor(.secondary)
+                    }
+                }
+            }
+            if model.selected.isEmpty {
+                Text("Ничего не выбрано — страна проверяться не будет, только туннель.")
+                    .font(.caption).foregroundColor(.orange)
+            }
+            if let e = model.error { Text(e).foregroundColor(.red).font(.caption) }
+            HStack {
+                Button("По умолчанию") { model.selected = Set(defaultCountries) }
+                Text("Выбрано: \(model.selected.count)").foregroundColor(.secondary)
+                Spacer()
+                Button("Сохранить") { if model.save() { onClose() } }.keyboardShortcut(.defaultAction)
+            }
         }
-        return true
+        .padding(16)
+        .frame(minWidth: 420, minHeight: 560)
     }
 }
 
@@ -171,7 +273,9 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }()
     let menu = NSMenu()
     let picker = PickerModel()
+    let countries = CountryModel()
     var window: NSWindow?
+    var countryWindow: NSWindow?
     var logWindow: NSWindow?
     var logView: NSTextView?
     var last: GuardStatus?
@@ -239,6 +343,12 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
                      color: s.vpn ? .systemGreen : .systemRed)
             }
             info("маршрут: \(s.iface.isEmpty ? "—" : s.iface), страна: \(s.country.isEmpty ? "нет ответа" : s.country)")
+            if let cc = s.countries {
+                let on = s.geo ?? true
+                info(!on ? "проверка страны выключена в конфиге"
+                     : cc.isEmpty ? "страны блокировки не выбраны"
+                     : "блокировать из: " + cc.map { "\(flag($0)) \($0)" }.joined(separator: "  "))
+            }
             menu.addItem(.separator())
             if s.apps.isEmpty { info("Приложения не выбраны") }
             for a in s.apps {
@@ -256,6 +366,9 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let pick = NSMenuItem(title: "Выбрать приложения…", action: #selector(openPicker), keyEquivalent: ",")
         pick.target = self
         menu.addItem(pick)
+        let cc = NSMenuItem(title: "Выбрать страны…", action: #selector(openCountries), keyEquivalent: "")
+        cc.target = self
+        menu.addItem(cc)
         let log = NSMenuItem(title: "Открыть журнал", action: #selector(openLog), keyEquivalent: "")
         log.target = self
         menu.addItem(log)
@@ -351,6 +464,25 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
         logView?.scrollToBeginningOfDocument(nil)
         NSApp.activate(ignoringOtherApps: true)
         logWindow?.makeKeyAndOrderFront(nil)
+    }
+
+    @objc func openCountries() {
+        // старый демон не пишет страны в status.json — тогда показать список по умолчанию
+        countries.load(current: last?.countries ?? defaultCountries, geoOn: last?.geo ?? true)
+        if countryWindow == nil {
+            let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 420, height: 560),
+                             styleMask: [.titled, .closable, .resizable], backing: .buffered, defer: false)
+            w.title = "Vafa — страны"
+            w.isReleasedWhenClosed = false
+            w.contentView = NSHostingView(rootView: CountryView(model: countries) { [weak self] in
+                self?.countryWindow?.close()
+                self?.refresh()
+            })
+            w.center()
+            countryWindow = w
+        }
+        NSApp.activate(ignoringOtherApps: true)
+        countryWindow?.makeKeyAndOrderFront(nil)
     }
 
     @objc func openPicker() {

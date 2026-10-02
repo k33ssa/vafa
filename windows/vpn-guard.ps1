@@ -7,7 +7,7 @@
 #   * (если задан block_nets) блокирует сеть к этим адресам Брандмауэром Windows.
 # Когда VPN возвращается — всё снимается.
 #
-# Команды: daemon | status | check | unlock | set-apps <файл.json>
+# Команды: daemon | status | check | unlock | set-apps <файл.json> | set-countries <файл.json>
 
 param([string]$Command = 'status', [string]$Arg = '')
 
@@ -60,10 +60,18 @@ public static class VGNative {
 '@ -ErrorAction SilentlyContinue
 
 # ---- конфиг -----------------------------------------------------------------
+# Страны, из которых VPN считается выключенным: Россия, Китай, Беларусь, Иран
+$DefaultCountries = @('RU', 'CN', 'BY', 'IR')
+
+function Normalize-Countries($list) {
+    @(@($list) | ForEach-Object { "$_".Trim().ToUpper() } | Where-Object { $_ -match '^[A-Z]{2}$' } | Select-Object -Unique)
+}
+
 function Default-Conf {
     [pscustomobject]@{
-        apps = @(); checks = @('route', 'geo:!RU'); require = 'all'; on_down = 'freeze'
-        lock_launch = $true; block_nets = @(); interval = 2; geo_ttl = 15; geo_stale = 60; grace = 0
+        apps = @(); checks = @('route', 'geo'); require = 'all'; on_down = 'freeze'
+        lock_launch = $true; block_nets = @(); interval = 1; geo_ttl = 1; geo_ttl_down = 1; geo_stale = 60; grace = 0
+        block_countries = $DefaultCountries; net_watch = $true
     }
 }
 
@@ -115,12 +123,20 @@ function Load-Conf {
     try { $j = Get-Content $ConfPath -Raw -Encoding UTF8 | ConvertFrom-Json } catch { Log "конфиг не читается: $_"; return $null }
     if (-not $j) { return $null }
     foreach ($k in $c.PSObject.Properties.Name) { if ($null -ne $j.$k) { $c.$k = $j.$k } }
+    # старый конфиг без block_countries: список берётся из правила geo:!RU,…
+    if ($j.PSObject.Properties.Name -notcontains 'block_countries') {
+        $legacy = @($c.checks) | Where-Object { "$_" -like 'geo:!*' } | Select-Object -First 1
+        if ($legacy) { $c.block_countries = @("$legacy".Substring(5) -split ',') }
+    }
+    $c.block_countries = Normalize-Countries $c.block_countries
+    if ([int]$c.geo_ttl -lt 1) { $c.geo_ttl = 1 }
+    if ([int]$c.geo_ttl_down -lt 1) { $c.geo_ttl_down = 1 }
     $c.apps = @($c.apps | ForEach-Object { $_ } | ForEach-Object { "$_" } | Where-Object {
         if (Test-SafeAppPath $_) { $true } else { WarnOnce "bad:$_" "пропускаю недопустимый путь: $_"; $false }
     })
     if ($c.require -notin 'all', 'any') { $c.require = 'all' }
     if ($c.on_down -notin 'freeze', 'kill') { $c.on_down = 'freeze' }
-    if ([int]$c.interval -lt 1) { $c.interval = 2 }
+    if ([int]$c.interval -lt 1) { $c.interval = 1 }
     if (@($c.checks).Count -eq 0) { $c.checks = @('route') }
     return $c
 }
@@ -152,6 +168,7 @@ function Test-Tunnel($e) {
 }
 
 $script:Geo = @{ T = [datetime]::MinValue; If = ''; CC = ''; GoodT = [datetime]::MinValue; GoodCC = '' }
+$script:GuardDown = $false
 function Fetch-Geo([string]$url) {
     try {
         $r = Invoke-WebRequest -Uri $url -UseBasicParsing -TimeoutSec 4
@@ -161,10 +178,13 @@ function Fetch-Geo([string]$url) {
 }
 # Как на Маке: три попытки, при полном молчании на том же интерфейсе ещё geo_stale
 # секунд верим последнему ответу — иначе каждый таймаут Cloudflare = ложная блокировка.
+# Как часто: раз в geo_ttl с (по умолчанию каждую секунду; geo_ttl_down — при блокировке)
+# и сразу — по событию сети (см. Wait-Tick).
 function Refresh-Geo($conf) {
     $e = Get-EgressAdapter; $if = if ($e) { "$($e.Index)" } else { '' }
     $now = Get-Date
-    if (($now - $script:Geo.T).TotalSeconds -lt $conf.geo_ttl -and $if -eq $script:Geo.If) { return }
+    $ttl = if ($script:GuardDown) { $conf.geo_ttl_down } else { $conf.geo_ttl }
+    if (($now - $script:Geo.T).TotalSeconds -lt $ttl -and $if -eq $script:Geo.If) { return }
     $cc = ''
     foreach ($u in 'https://www.cloudflare.com/cdn-cgi/trace', 'https://1.1.1.1/cdn-cgi/trace', 'https://www.cloudflare.com/cdn-cgi/trace') {
         $cc = Fetch-Geo $u; if ($cc) { break }
@@ -181,10 +201,18 @@ function Refresh-Geo($conf) {
 function Test-Check([string]$rule, $conf) {
     switch -Regex ($rule) {
         '^route$'      { return (Test-Tunnel (Get-EgressAdapter)) }
-        '^geo:(.+)$'   {
+        # geo, geo:!RU — страна выхода не из block_countries (пустой список — не проверять)
+        '^geo(:!.*)?$' {
+            $bad = @($conf.block_countries)
+            if ($bad.Count -eq 0) { return $true }
+            Refresh-Geo $conf; $cc = $script:Geo.CC
+            if (-not $cc) { return $false }
+            return -not ($bad -contains $cc)
+        }
+        # geo:FR,NL — страна выхода из списка
+        '^geo:([^!].*)$' {
             $spec = $Matches[1]; Refresh-Geo $conf; $cc = $script:Geo.CC
             if (-not $cc) { return $false }
-            if ($spec.StartsWith('!')) { return -not (($spec.Substring(1) -split ',') -contains $cc) }
             return (($spec -split ',') -contains $cc)
         }
         '^adapter:(.+)$' { return [bool](Get-NetAdapter -Name $Matches[1] -IncludeHidden -ErrorAction SilentlyContinue | Where-Object Status -eq 'Up') }
@@ -303,12 +331,42 @@ function Write-Status($conf, [bool]$vpn, $all) {
     $o = [pscustomobject]@{
         time = [int][double]::Parse((Get-Date -UFormat %s)); vpn = $vpn
         iface = if ($e) { "$($e.Alias)" } else { '' }; country = $script:Geo.CC; on_down = $conf.on_down
+        countries = @($conf.block_countries)
+        geo = [bool](@($conf.checks) | Where-Object { "$_" -match '^geo(:|$)' })
         apps = @($apps)
     }
     $tmp = "$StatusPath.$PID.tmp"
     [IO.File]::WriteAllText($tmp, ($o | ConvertTo-Json -Depth 4 -Compress), (New-Object Text.UTF8Encoding $false))
     # Replace — атомарно, трей никогда не увидит пустой или полузаписанный файл
     if (Test-Path $StatusPath) { [IO.File]::Replace($tmp, $StatusPath, [NullString]::Value) } else { [IO.File]::Move($tmp, $StatusPath) }
+}
+
+# ---- ожидание: таймер или событие сети ---------------------------------------
+# NetworkAddressChanged приходит, когда у адаптера меняется адрес: VPN поднялся,
+# упал, переподключился. Пока сеть не меняется, служба просто спит interval секунд.
+$script:NetWatch = $false
+function Start-NetWatch($conf) {
+    if (-not $conf.net_watch -or $script:NetWatch) { return }
+    try {
+        Register-ObjectEvent -InputObject ([Net.NetworkInformation.NetworkChange]) `
+            -EventName NetworkAddressChanged -SourceIdentifier VafaNet | Out-Null
+        $script:NetWatch = $true
+    } catch { WarnOnce 'netwatch' "не удалось подписаться на события сети — работаю по таймеру: $_" }
+}
+
+# true — проснулись по событию сети (тогда страну надо спросить заново)
+function Wait-Tick($conf) {
+    if (-not $script:NetWatch) { Start-Sleep -Seconds $conf.interval; return $false }
+    $ev = Wait-Event -SourceIdentifier VafaNet -Timeout $conf.interval
+    if (-not $ev) { return $false }
+    $n = 0
+    # VPN при подключении шлёт пачку событий — дождаться тишины и забрать все
+    do {
+        Remove-Event -SourceIdentifier VafaNet -ErrorAction SilentlyContinue
+        $more = Wait-Event -SourceIdentifier VafaNet -Timeout 1
+    } while ($more -and ++$n -lt 10)
+    Remove-Event -SourceIdentifier VafaNet -ErrorAction SilentlyContinue
+    return $true
 }
 
 # ---- команды ----------------------------------------------------------------
@@ -320,7 +378,8 @@ function Cmd-Daemon {
     if (-not $got) { Write-Host 'vpn-guard уже запущен'; return }
     $conf = Load-Conf; if ($null -eq $conf) { $conf = Default-Conf }
     $mt = if (Test-Path $ConfPath) { (Get-Item $ConfPath).LastWriteTimeUtc } else { $null }
-    Log "vpn-guard запущен: правила=[$($conf.checks -join ' ')] ($($conf.require)), при падении VPN=$($conf.on_down), приложений: $(@($conf.apps).Count)"
+    Log "vpn-guard запущен: правила=[$($conf.checks -join ' ')] ($($conf.require)), при падении VPN=$($conf.on_down), приложений: $(@($conf.apps).Count), страны блокировки: $(if ($conf.block_countries) { $conf.block_countries -join ' ' } else { 'не заданы' })"
+    Start-NetWatch $conf
     $last = 'init'; $downSince = $null; $lastLock = [datetime]::MinValue
     while ($true) {
         try {
@@ -335,7 +394,7 @@ function Cmd-Daemon {
             $all = Get-CimInstance Win32_Process -Property ProcessId, Name, ExecutablePath
             if (Test-VpnUp $conf) {
                 if ($last -ne 'up') { Log 'VPN поднят — снимаю блокировку'; $last = 'up' }
-                $downSince = $null
+                $downSince = $null; $script:GuardDown = $false
                 foreach ($a in $conf.apps) { Unlock-App $a; Resume-App $a $all }
                 Set-Firewall 'up' $conf (Get-EgressAdapter)
                 Write-Status $conf $true $all
@@ -347,6 +406,7 @@ function Cmd-Daemon {
                         Log "VPN не обнаружен (интерфейс: $($e.Alias), страна: $(if ($script:Geo.CC) { $script:Geo.CC } else { '?' })) — блокирую"
                         $last = 'down'; $lastLock = [datetime]::MinValue
                     }
+                    $script:GuardDown = $true
                     foreach ($a in $conf.apps) {
                         # проход по exe — раз в 30 с: ловит файлы, появившиеся после обновления
                         if ($conf.lock_launch -and ((Get-Date) - $lastLock).TotalSeconds -ge 30) { Lock-App $a }
@@ -358,7 +418,8 @@ function Cmd-Daemon {
                 Write-Status $conf $false $all
             }
         } catch { WarnOnce "err:$_" "ошибка в цикле: $_" }
-        Start-Sleep -Seconds $conf.interval
+        # сеть поменялась — на следующем круге страну спросить заново, не ждать geo_ttl
+        if (Wait-Tick $conf) { $script:Geo.T = [datetime]::MinValue }
     }
 }
 
@@ -367,7 +428,7 @@ function Cmd-Check {
     foreach ($r in $conf.checks) {
         $ok = Test-Check $r $conf
         $note = if ($ok) { "  [ да ] $r" } else { "  [ нет] $r" }
-        if ($r -like 'geo:*') { $note += "   (страна выхода: $(if ($script:Geo.CC) { $script:Geo.CC } else { 'нет ответа' }))" }
+        if ($r -match '^geo(:|$)') { $note += "   (страна выхода: $(if ($script:Geo.CC) { $script:Geo.CC } else { 'нет ответа' }); блокировать: $(if ($conf.block_countries) { $conf.block_countries -join ' ' } else { 'ничего' }))" }
         Write-Host $note
     }
     $e = Get-EgressAdapter
@@ -415,11 +476,23 @@ function Cmd-SetApps([string]$file) {
     Write-Host "сохранено приложений: $($ok.Count)"
 }
 
+# вызывается треем через «Запуск от имени администратора»: заменить список стран
+function Cmd-SetCountries([string]$file) {
+    $ok = Normalize-Countries (Get-Content $file -Raw -Encoding UTF8 | ConvertFrom-Json | ForEach-Object { $_ })
+    $conf = if (Test-Path $ConfPath) { Get-Content $ConfPath -Raw -Encoding UTF8 | ConvertFrom-Json } else { Default-Conf }
+    $conf | Add-Member -NotePropertyName block_countries -NotePropertyValue @($ok) -Force
+    if (Test-Path $ConfPath) { (Get-Item $ConfPath).IsReadOnly = $false }
+    $conf | ConvertTo-Json -Depth 4 | Set-Content "$ConfPath.tmp" -Encoding UTF8
+    Move-Item "$ConfPath.tmp" $ConfPath -Force
+    Write-Host "страны блокировки: $(if ($ok) { $ok -join ' ' } else { 'не заданы' })"
+}
+
 switch ($Command) {
     'daemon'   { Cmd-Daemon }
     'status'   { Cmd-Status }
     'check'    { Cmd-Check }
     'unlock'   { Cmd-Unlock }
     'set-apps' { Cmd-SetApps $Arg }
-    default    { Write-Host 'использование: vpn-guard.ps1 {daemon|status|check|unlock|set-apps <файл>}'; exit 1 }
+    'set-countries' { Cmd-SetCountries $Arg }
+    default    { Write-Host 'использование: vpn-guard.ps1 {daemon|status|check|unlock|set-apps <файл>|set-countries <файл>}'; exit 1 }
 }

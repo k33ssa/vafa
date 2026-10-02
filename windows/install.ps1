@@ -21,7 +21,30 @@ if (-not (Test-Path $conf)) {
     Copy-Item "$Src\config.default.json" $conf
     (Get-Item $conf).IsReadOnly = $false   # из общей папки/архива файл может прийти «только чтение»
     Write-Host "Конфиг: $conf (новый)"
-} else { Write-Host "Конфиг $conf уже был — оставил как есть." }
+} else {
+    Write-Host "Конфиг $conf уже был — оставил как есть."
+    # обновление со старой версии: добавить страны блокировки (Китай, Беларусь, Иран
+    # к прежнему geo:!RU), иначе служба так и проверяла бы только Россию
+    $j = Get-Content $conf -Raw -Encoding UTF8 | ConvertFrom-Json
+    if ($j.PSObject.Properties.Name -notcontains 'block_countries') {
+        $old = @($j.checks) | Where-Object { "$_" -like 'geo:!*' } | ForEach-Object { "$_".Substring(5) -split ',' }
+        $cc = @(@('RU', 'CN', 'BY', 'IR') + @($old) | ForEach-Object { "$_".Trim().ToUpper() } | Where-Object { $_ -match '^[A-Z]{2}$' } | Select-Object -Unique)
+        $j | Add-Member -NotePropertyName block_countries -NotePropertyValue $cc
+        (Get-Item $conf).IsReadOnly = $false
+        $j | ConvertTo-Json -Depth 4 | Set-Content $conf -Encoding UTF8
+        Write-Host "Страны блокировки: $($cc -join ' ')"
+    }
+    # старые значения по умолчанию (опрос раз в 2 с, страна раз в 15 с) — на раз в секунду;
+    # если их меняли руками, не трогать
+    $j = Get-Content $conf -Raw -Encoding UTF8 | ConvertFrom-Json
+    if ($j.interval -eq 2 -and $j.geo_ttl -eq 15) {
+        $j.interval = 1; $j.geo_ttl = 1
+        $j | Add-Member -NotePropertyName geo_ttl_down -NotePropertyValue 1 -Force
+        (Get-Item $conf).IsReadOnly = $false
+        $j | ConvertTo-Json -Depth 4 | Set-Content $conf -Encoding UTF8
+        Write-Host 'Конфиг: проверка VPN и страны — теперь каждую секунду.'
+    }
+}
 
 # служба = задача Планировщика от SYSTEM: при загрузке, перезапуск при падении
 $action  = New-ScheduledTaskAction -Execute 'powershell.exe' `

@@ -26,16 +26,21 @@ PLIST=/Library/LaunchDaemons/local.vpnguard.plist
 typeset -ga APPS=()
 typeset -ga VPN_CHECK=( route )
 typeset -ga BLOCK_NETS=()
+typeset -ga BLOCK_COUNTRIES=( RU CN BY IR )   # страны, где VPN считается выключенным
+typeset -ga BAD_CC=()                         # действующий список (см. load_conf)
 VPN_REQUIRE=all      # all | any
 ON_DOWN=freeze       # freeze | kill
 LOCK_LAUNCH=1
 MATCH_ANY_PATH=0
-INTERVAL=2
+INTERVAL=1
 GRACE=0
 NOTIFY=1
-GEO_TTL=15
+GEO_TTL=1            # перепроверять страну выхода раз в столько секунд (VPN поднят)
+GEO_TTL_DOWN=1       # то же во время блокировки
 GEO_STALE=60
+NET_WATCH=1          # будить демон событиями сети (route -n monitor), а не только таймером
 APPS_FILE=${VPN_GUARD_APPS:-/usr/local/etc/vpn-guard.apps}
+COUNTRIES_FILE=${VPN_GUARD_COUNTRIES:-/usr/local/etc/vpn-guard.countries}
 STATUS_FILE=$STATE_DIR/status.json
 
 typeset -gA TERMED=()
@@ -57,7 +62,8 @@ warn_once() {
 
 die() { print -ru2 -- "vpn-guard: $*"; exit 1; }
 
-need_root() { (( EUID == 0 )) || die "нужны права root — запусти через sudo"; }
+# VPN_GUARD_TEST=1 — только для tests/run.sh: демон без root на временных файлах
+need_root() { (( EUID == 0 )) || [[ ${VPN_GUARD_TEST:-} == 1 ]] || die "нужны права root — запусти через sudo"; }
 
 state_key() {
   local app=$1 base h
@@ -104,8 +110,9 @@ conf_is_safe() {
 validate_conf() {
   [[ $VPN_REQUIRE == (all|any) ]] || { log "VPN_REQUIRE=$VPN_REQUIRE — беру all"; VPN_REQUIRE=all }
   [[ $ON_DOWN == (freeze|kill) ]] || { log "ON_DOWN=$ON_DOWN — беру freeze"; ON_DOWN=freeze }
-  [[ $INTERVAL == <1-3600> ]]     || { log "INTERVAL=$INTERVAL — беру 2"; INTERVAL=2 }
-  [[ $GEO_TTL == <1-3600> ]]      || { log "GEO_TTL=$GEO_TTL — беру 15"; GEO_TTL=15 }
+  [[ $INTERVAL == <1-3600> ]]     || { log "INTERVAL=$INTERVAL — беру 1"; INTERVAL=1 }
+  [[ $GEO_TTL == <1-3600> ]]      || { log "GEO_TTL=$GEO_TTL — беру 1"; GEO_TTL=1 }
+  [[ $GEO_TTL_DOWN == <1-3600> ]] || { log "GEO_TTL_DOWN=$GEO_TTL_DOWN — беру 1"; GEO_TTL_DOWN=1 }
   [[ $GEO_STALE == <0-3600> ]]    || { log "GEO_STALE=$GEO_STALE — беру 60"; GEO_STALE=60 }
   [[ $GRACE == <0-3600> ]]        || { log "GRACE=$GRACE — беру 0"; GRACE=0 }
   (( ${#VPN_CHECK} )) || { log "VPN_CHECK пуст — беру route"; VPN_CHECK=( route ) }
@@ -131,6 +138,44 @@ load_apps_file() {
   return 0
 }
 
+# Страны блокировки из Vafa.app: одна строка — один двухбуквенный код (RU, CN…).
+# Пустой файл — страну не проверять. Печатает список; код 1 — файла нет.
+load_countries_file() {
+  [[ -e $COUNTRIES_FILE ]] || return 1
+  conf_is_safe $COUNTRIES_FILE || return 1
+  local line; local -a out=()
+  while IFS= read -r line || [[ -n $line ]]; do
+    line=${line//[[:space:]]/}
+    [[ -z $line || $line == \#* ]] && continue
+    line=${(U)line}
+    if [[ $line == [A-Z][A-Z] ]]; then
+      (( ${out[(I)$line]} )) || out+=( $line )
+    else
+      warn_once "badcc:$line" "в $COUNTRIES_FILE пропускаю непонятный код страны: $line"
+    fi
+  done < $COUNTRIES_FILE
+  BAD_CC=( $out[@] )
+  return 0
+}
+
+# Действующий список стран блокировки, по старшинству:
+#   1) файл от Vafa.app (выбор в окне «Страны»);
+#   2) список из правила geo:!RU,… в VPN_CHECK (старые конфиги);
+#   3) BLOCK_COUNTRIES из конфига.
+pick_bad_countries() {
+  load_countries_file && return 0
+  local rule
+  for rule in $VPN_CHECK[@]; do
+    if [[ $rule == geo:\!* ]]; then
+      BAD_CC=( ${(s:,:)${(U)${rule#geo:\!}}} )
+      return 0
+    fi
+  done
+  BAD_CC=( ${(U)BLOCK_COUNTRIES[@]} )
+}
+
+geo_rule_on() { (( ${VPN_CHECK[(I)geo(|:*)]} )) }
+
 load_conf() {
   if conf_is_safe $CONF; then
     source $CONF
@@ -140,9 +185,16 @@ load_conf() {
   fi
   load_apps_file
   validate_conf
+  pick_bad_countries
 }
 
-conf_mtime() { print "$(stat -f '%m' -- $CONF 2>/dev/null || print 0)/$(stat -f '%m' -- $APPS_FILE 2>/dev/null || print 0)" }
+conf_mtime() {
+  local f; local -a m=()
+  # inode, mtime с наносекундами и размер: щит пишет файл через install (новый inode),
+  # а одной секунды mtime мало — два сохранения подряд сливались в одно
+  for f in $CONF $APPS_FILE $COUNTRIES_FILE; do m+=( "$(stat -f '%i:%Fm:%z' -- $f 2>/dev/null || print 0)" ); done
+  print -r -- ${(j:/:)m}
+}
 
 # ---- определение VPN --------------------------------------------------------
 _default_iface() {
@@ -175,16 +227,22 @@ _nc_connected() {
 # 372 из 441 блокировки были с «страна: ?» при живом туннеле, т.е. Cloudflare просто
 # не ответил за 4 с. Поэтому: до трёх попыток (второй адрес — по IP, мимо DNS), а
 # если все мимо — на том же интерфейсе ещё GEO_STALE секунд верим последнему ответу.
-typeset -g GEO_LAST_T=0 GEO_LAST_IF='' GEO_LAST_CC='' GEO_GOOD_T=0 GEO_GOOD_CC=''
+#
+# Как часто: раз в GEO_TTL с (по умолчанию каждую секунду; GEO_TTL_DOWN — при блокировке)
+# и сразу же — по событию сети (см. wait_tick). Запрос — 1 КБ, curl живёт доли секунды.
+typeset -g GEO_LAST_T=0 GEO_LAST_IF='' GEO_LAST_CC='' GEO_GOOD_T=0 GEO_GOOD_CC='' GUARD_DOWN=0
+typeset -ga GEO_URLS=( https://www.cloudflare.com/cdn-cgi/trace https://1.1.1.1/cdn-cgi/trace
+                       https://www.cloudflare.com/cdn-cgi/trace )
+[[ -n ${VPN_GUARD_GEO_URLS:-} ]] && GEO_URLS=( ${=VPN_GUARD_GEO_URLS} )   # для tests/run.sh
 _geo_fetch() {
   curl -s --max-time 4 $1 2>/dev/null | awk -F= '$1=="loc"{print $2; exit}'
 }
 _geo_refresh() {
-  local i cc='' url
+  local i cc='' url ttl=$GEO_TTL
+  (( GUARD_DOWN )) && ttl=$GEO_TTL_DOWN
   i=$(_default_iface)
-  if (( EPOCHSECONDS - GEO_LAST_T >= GEO_TTL )) || [[ $i != $GEO_LAST_IF ]]; then
-    for url in https://www.cloudflare.com/cdn-cgi/trace https://1.1.1.1/cdn-cgi/trace \
-               https://www.cloudflare.com/cdn-cgi/trace; do
+  if (( EPOCHSECONDS - GEO_LAST_T >= ttl )) || [[ $i != $GEO_LAST_IF ]]; then
+    for url in $GEO_URLS[@]; do
       cc=$(_geo_fetch $url)
       [[ -n $cc ]] && break
     done
@@ -201,17 +259,21 @@ _geo_refresh() {
   fi
 }
 
-# geo:!RU    — страна выхода НЕ из списка;  geo:FR,NL — страна выхода из списка.
+# geo, geo:!RU — страна выхода НЕ из списка стран блокировки (BAD_CC; у geo:!…
+#                свой список работает, только пока страны не выбраны в Vafa.app);
+# geo:FR,NL    — страна выхода из списка.
 # Нет ответа (нет сети, Cloudflare недоступен) — считаем, что VPN нет.
 _geo_ok() {
   local spec=$1
-  _geo_refresh
-  [[ -n $GEO_LAST_CC ]] || return 1
   if [[ $spec == \!* ]]; then
-    local -a bad=( ${(s:,:)${spec#\!}} )
-    (( ${bad[(I)$GEO_LAST_CC]} )) && return 1
+    (( ${#BAD_CC} )) || return 0   # страны не выбраны — страну не проверяем
+    _geo_refresh
+    [[ -n $GEO_LAST_CC ]] || return 1
+    (( ${BAD_CC[(I)$GEO_LAST_CC]} )) && return 1
     return 0
   fi
+  _geo_refresh
+  [[ -n $GEO_LAST_CC ]] || return 1
   local -a good=( ${(s:,:)spec} )
   (( ${good[(I)$GEO_LAST_CC]} ))
 }
@@ -220,6 +282,7 @@ _one_check() {
   local rule=$1
   case $rule in
     (route)     _route_is_vpn ;;
+    (geo)       _geo_ok '!' ;;
     (geo:*)     _geo_ok "${rule#geo:}" ;;
     (scutil)    _nc_connected '' ;;
     (nc:*)      _nc_connected "${rule#nc:}" ;;
@@ -468,7 +531,11 @@ write_status() {
   local vpn=$1 a pid st n fz lk sep='' tmp=$STATUS_FILE.tmp
   {
     print -rn -- "{\"time\":$EPOCHSECONDS,\"vpn\":$vpn,\"iface\":$(json_str "$(_default_iface)"),"
-    print -rn -- "\"country\":$(json_str "$GEO_LAST_CC"),\"on_down\":$(json_str $ON_DOWN),\"apps\":["
+    print -rn -- "\"country\":$(json_str "$GEO_LAST_CC"),\"on_down\":$(json_str $ON_DOWN),"
+    print -rn -- "\"geo\":$(geo_rule_on && print true || print false),\"countries\":["
+    local c csep=''
+    for c in $BAD_CC[@]; do print -rn -- "$csep$(json_str $c)"; csep=,; done
+    print -rn -- "],\"apps\":["
     for a in $APPS[@]; do
       n=0 fz=0 lk=false
       for pid in ${(f)"$(app_pids $a)"}; do
@@ -500,14 +567,78 @@ prune_stale_locks() {
   return 0
 }
 
+# ---- ожидание: таймер или событие сети ---------------------------------------
+# route -n monitor молчит, пока сеть не меняется (обычный трафик событий не даёт),
+# и сразу пишет, когда VPN падает, поднимается или меняет адрес. awk пропускает только
+# смену маршрутов и адресов: RTM_GET шлёт любой `route get`, в том числе наш же
+# _default_iface — без фильтра демон будил бы сам себя.
+typeset -g NET_FD='' NET_RETRY_T=0 NET_EVENT=0
+NET_MONITOR=${VPN_GUARD_NET_MONITOR:-"route -n monitor"}   # подменяется в tests/run.sh
+
+net_watch_start() {
+  (( NET_WATCH )) || return 0
+  [[ -z $NET_FD ]] || return 0
+  (( EPOCHSECONDS >= NET_RETRY_T )) || return 0
+  exec {NET_FD}< <(${=NET_MONITOR} 2>/dev/null |
+    awk '/^RTM_(ADD|DELETE|CHANGE|NEWADDR|DELADDR|IFINFO)/{print $1; fflush()}')
+}
+
+# Монитор живёт в подоболочке (route | awk) и сам не умирает: пока сеть молчит, ему
+# некуда писать и SIGPIPE не прилетает. Поэтому гасить его деревом процессов.
+# Других долгих детей у демона нет (curl, ps и т.п. — синхронные), так что
+# «все дети демона» = монитор.
+kill_tree() {
+  local c
+  for c in $(pgrep -P $1 2>/dev/null); do kill_tree $c; done
+  kill $1 2>/dev/null
+  return 0
+}
+
+net_watch_stop() {
+  local c
+  for c in $(pgrep -P $$ 2>/dev/null); do kill_tree $c; done
+  [[ -n $NET_FD ]] && exec {NET_FD}<&-
+  NET_FD=''
+  return 0
+}
+
+# Ждёт INTERVAL секунд или первого события сети. Событие: забрать всю пачку (VPN при
+# подключении шлёт их десяток), пометить NET_EVENT — следующий круг заново спросит страну.
+wait_tick() {
+  local line t0=$EPOCHREALTIME
+  NET_EVENT=0
+  net_watch_start
+  if [[ -z $NET_FD ]]; then
+    sleep $INTERVAL
+    return 0
+  fi
+  if read -t $INTERVAL -u $NET_FD line; then
+    NET_EVENT=1
+    local n=0
+    while (( n++ < 200 )) && read -t 0.2 -u $NET_FD line; do :; done
+    return 0
+  fi
+  # read вернул «нет» раньше срока — поток кончился (монитор упал), а не таймаут
+  if (( EPOCHREALTIME - t0 < INTERVAL - 0.2 )); then
+    net_watch_stop
+    NET_RETRY_T=$(( EPOCHSECONDS + 30 ))
+    warn_once "netwatch:$NET_RETRY_T" "монитор сети ($NET_MONITOR) остановился — работаю по таймеру, повтор через 30 с"
+    local left=$(( INTERVAL - (EPOCHREALTIME - t0) ))
+    (( left > 0 )) && sleep $left
+  fi
+  return 0
+}
+
 # ---- подкоманды -------------------------------------------------------------
 cmd_daemon() {
   need_root
   mkdir -p $PERM_DIR
   chmod 755 $STATE_DIR   # status.json должен читаться без sudo; perms/ остаётся 700
   load_conf
+  # остановка демона (launchctl bootout, kill) — убрать за собой монитор сети
+  trap 'net_watch_stop; exit 0' TERM INT HUP
   local a last=init down_since=0 mt=$(conf_mtime)
-  log "vpn-guard запущен: правила=[${VPN_CHECK[*]}] ($VPN_REQUIRE), при падении VPN=$ON_DOWN, блокировка запуска=$LOCK_LAUNCH, интервал=${INTERVAL}с"
+  log "vpn-guard запущен: правила=[${VPN_CHECK[*]}] ($VPN_REQUIRE), при падении VPN=$ON_DOWN, блокировка запуска=$LOCK_LAUNCH, интервал=${INTERVAL}с, страны блокировки: ${BAD_CC[*]:-не заданы}"
   (( ${#APPS} )) || log "ВНИМАНИЕ: список APPS пуст — сторожить нечего"
   prune_stale_locks
 
@@ -520,7 +651,12 @@ cmd_daemon() {
       last=init
       PF_CUR=''
       (( ${#BLOCK_NETS} )) || pf_off
+      (( NET_WATCH )) || net_watch_stop
     fi
+
+    # сеть поменялась — страну спросить заново, не дожидаясь GEO_TTL (пачку событий
+    # от переподключения VPN wait_tick уже схлопнул в одно)
+    (( NET_EVENT )) && GEO_LAST_T=0
 
     if vpn_up; then
       if [[ $last != up ]]; then
@@ -529,6 +665,7 @@ cmd_daemon() {
         last=up
       fi
       down_since=0
+      GUARD_DOWN=0
       TERMED=()
       for a in $APPS[@]; do
         unlock_app $a
@@ -544,6 +681,7 @@ cmd_daemon() {
           notify "VPN выключен" "приложения заблокированы"
           last=down
         fi
+        GUARD_DOWN=1
         for a in $APPS[@]; do
           (( LOCK_LAUNCH )) && lock_app $a
           case $ON_DOWN in
@@ -555,7 +693,7 @@ cmd_daemon() {
       fi
       write_status false
     fi
-    sleep $INTERVAL
+    wait_tick
   done
 }
 
@@ -565,7 +703,7 @@ cmd_check() {
   for rule in $VPN_CHECK[@]; do
     local note=''
     if _one_check $rule; then note="  [ да ] $rule"; else note="  [ нет] $rule"; fi
-    [[ $rule == geo:* ]] && note+="   (страна выхода: ${GEO_LAST_CC:-нет ответа})"
+    [[ $rule == geo(|:*) ]] && note+="   (страна выхода: ${GEO_LAST_CC:-нет ответа}; блокировать: ${BAD_CC[*]:-ничего})"
     print -r -- $note
   done
   if vpn_up; then

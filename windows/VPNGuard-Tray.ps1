@@ -18,14 +18,36 @@ $RunName    = 'VPNGuard'
 $mutex = New-Object Threading.Mutex($false, "Local\VPNGuardTray")
 if (-not $mutex.WaitOne(0)) { exit }
 
+# Чтение с FILE_SHARE_DELETE: не мешает службе заменять файл (Get-Content такой доли не
+# даёт, и замена status.json у службы срывалась)
 function Read-Status {
-    try { return (Get-Content $StatusPath -Raw -Encoding UTF8 | ConvertFrom-Json) } catch { return $null }
+    try {
+        $fs = [IO.File]::Open($StatusPath, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]'ReadWrite, Delete')
+        try { return ((New-Object IO.StreamReader($fs, [Text.Encoding]::UTF8)).ReadToEnd() | ConvertFrom-Json) } finally { $fs.Dispose() }
+    } catch { return $null }
 }
 function Is-Stale($s) { -not $s -or (([DateTimeOffset]::UtcNow.ToUnixTimeSeconds()) - $s.time) -gt 20 }
+# up | unsure | down; старая служба без поля state — по vpn
+function State-Of($s) { if ($s.state) { "$($s.state)" } elseif ($s.vpn) { 'up' } else { 'down' } }
+function State-Text($s) {
+    switch (State-Of $s) {
+        'up'     { 'VPN: поднят' }
+        'unsure' { 'VPN: страна не подтверждена — сеть закрыта, приложения работают' }
+        default  { 'VPN: ВЫКЛЮЧЕН — блокировка' }
+    }
+}
+# строка про сеть; $null — служба старая, поля net нет
+function Net-Text($s) {
+    if ($null -eq $s.net_ok) { return $null }
+    if (-not $s.net_ok) { return "Сеть к Anthropic: НЕ ЗАЩИЩЕНА ($(if ($s.net_error) { $s.net_error } else { 'причина неизвестна' }))" }
+    if ("$($s.net)" -like 'via:*') { return "Сеть к Anthropic: только через $("$($s.net)".Substring(4))" }
+    return 'Сеть к Anthropic: закрыта'
+}
 function App-Name([string]$p) { $leaf = Split-Path $p -Leaf; if ($leaf -match '\.exe$') { $leaf = $leaf -replace '\.exe$' }; $leaf }
 
-# Щит рисуем сами: залитый (зелёный/красный) или пустой контур (охрана выключена).
-function New-ShieldIcon([Drawing.Color]$c, [bool]$filled) {
+# Щит рисуем сами: залитый (зелёный/оранжевый/красный) или пустой контур (охрана
+# выключена); с «!» — служба не отвечает.
+function New-ShieldIcon([Drawing.Color]$c, [bool]$filled, [bool]$mark = $false) {
     $bmp = New-Object Drawing.Bitmap 32, 32
     $g = [Drawing.Graphics]::FromImage($bmp)
     $g.SmoothingMode = 'AntiAlias'
@@ -34,16 +56,30 @@ function New-ShieldIcon([Drawing.Color]$c, [bool]$filled) {
         (New-Object Drawing.PointF 16, 30), (New-Object Drawing.PointF 5, 17), (New-Object Drawing.PointF 4, 7))
     if ($filled) { $g.FillPolygon((New-Object Drawing.SolidBrush $c), $pts) }
     $g.DrawPolygon((New-Object Drawing.Pen $c, 3), $pts)
+    if ($mark) {
+        $w = New-Object Drawing.SolidBrush ([Drawing.Color]::White)
+        $g.FillRectangle($w, 14, 8, 4, 11); $g.FillRectangle($w, 14, 21, 4, 4)
+    }
     $g.Dispose()
     [Drawing.Icon]::FromHandle($bmp.GetHicon())
 }
 $IconUp   = New-ShieldIcon ([Drawing.Color]::FromArgb(40, 180, 70)) $true
 $IconDown = New-ShieldIcon ([Drawing.Color]::FromArgb(220, 50, 50)) $true
 $IconOff  = New-ShieldIcon ([Drawing.Color]::FromArgb(40, 180, 70)) $false
+$IconWarn = New-ShieldIcon ([Drawing.Color]::FromArgb(240, 140, 20)) $true
+$IconDead = New-ShieldIcon ([Drawing.Color]::FromArgb(240, 140, 20)) $true $true
 
-function Guard-On {
+# Включена ли задача VPNGuard. Get-ScheduledTask — запрос WMI: раз в 2 с по таймеру он
+# грузил WmiPrvSE. Поэтому кэш на 30 с; свежий ответ — при открытии меню и после
+# переключения «Охрана включена».
+$GuardC = @{ T = $null; V = $false }
+$GuardSw = [Diagnostics.Stopwatch]::StartNew()
+function Guard-On([switch]$Fresh) {
+    $now = $GuardSw.Elapsed.TotalSeconds
+    if (-not $Fresh -and $null -ne $GuardC.T -and $now - $GuardC.T -lt 30) { return $GuardC.V }
     $t = Get-ScheduledTask -TaskName VPNGuard -ErrorAction SilentlyContinue
-    return ($t -and $t.State -ne 'Disabled')
+    $GuardC.V = [bool]($t -and $t.State -ne 'Disabled'); $GuardC.T = $now
+    return $GuardC.V
 }
 
 function Run-Elevated([string]$script) {
@@ -85,7 +121,7 @@ function Show-Picker {
     $ico = Join-Path $PSScriptRoot 'vafa.ico'; if (Test-Path $ico) { $f.Icon = New-Object Drawing.Icon $ico }
 
     $status = New-Object Windows.Forms.Label
-    $status.Dock = 'Top'; $status.Height = 110; $status.Padding = New-Object Windows.Forms.Padding 10
+    $status.Dock = 'Top'; $status.Height = 130; $status.Padding = New-Object Windows.Forms.Padding 10
     $f.Controls.Add($status)
 
     $list = New-Object Windows.Forms.CheckedListBox
@@ -132,15 +168,21 @@ function Show-Picker {
 
     $upd = {
         $s = Read-Status
-        if (Is-Stale $s) { $status.Text = "Охрана выключена`n(служба не работает)"; $status.ForeColor = 'DarkOrange'; return }
-        $t = if ($s.vpn) { 'VPN: поднят' } else { 'VPN: ВЫКЛЮЧЕН — блокировка' }
+        if (Is-Stale $s) {
+            $status.Text = if (Guard-On) { "Служба не отвечает`n(охрана включена, но status.json не обновляется)" } else { "Охрана выключена`n(служба не работает)" }
+            $status.ForeColor = 'DarkOrange'; return
+        }
+        $t = State-Text $s
         $t += "`nинтерфейс: $($s.iface), страна: $(if ($s.country) { $s.country } else { 'нет ответа' })"
         if (@($s.countries).Count) { $t += "; блокировать из: $(@($s.countries) -join ', ')" }
+        $nt = Net-Text $s; if ($nt) { $t += "`n$nt" }
         foreach ($a in $s.apps) {
             $t += "`n$(App-Name $a.path) — запуск: $(if ($a.locked) { 'ЗАБЛОКИРОВАНО' } else { 'разблокировано' }), процессов: $($a.procs)"
             if ($a.frozen) { $t += ", заморожено: $($a.frozen)" }
         }
-        $status.Text = $t; $status.ForeColor = if ($s.vpn) { 'Green' } else { 'Red' }
+        $st = State-Of $s
+        $status.Text = $t
+        $status.ForeColor = if ($st -eq 'down') { 'Red' } elseif ($st -eq 'unsure' -or $s.net_ok -eq $false) { 'DarkOrange' } else { 'Green' }
     }
     & $upd
     $tm = New-Object Windows.Forms.Timer; $tm.Interval = 2000; $tm.Add_Tick($upd); $tm.Start()
@@ -265,9 +307,11 @@ $ni.ContextMenuStrip = $menu
 function Rebuild-Menu {
     $menu.Items.Clear()
     $s = Read-Status
-    if (Is-Stale $s) { [void]$menu.Items.Add('Охрана выключена') }
+    $on = Guard-On -Fresh
+    if (Is-Stale $s) { [void]$menu.Items.Add($(if ($on) { 'Служба не отвечает — состояние неизвестно' } else { 'Охрана выключена' })) }
     else {
-        [void]$menu.Items.Add($(if ($s.vpn) { 'VPN: поднят' } else { 'VPN: ВЫКЛЮЧЕН — блокировка' }))
+        [void]$menu.Items.Add((State-Text $s))
+        $nt = Net-Text $s; if ($nt) { [void]$menu.Items.Add($nt) }
         [void]$menu.Items.Add("интерфейс: $($s.iface), страна: $(if ($s.country) { $s.country } else { 'нет ответа' })")
         if ($null -ne $s.countries) {
             [void]$menu.Items.Add($(if ($s.geo -eq $false) { 'проверка страны выключена в конфиге' }
@@ -285,13 +329,16 @@ function Rebuild-Menu {
     $menu.Items.Add('Выбрать страны…').Add_Click({ Show-Countries })
 
     $g = New-Object Windows.Forms.ToolStripMenuItem 'Охрана включена'
-    $g.Checked = Guard-On
+    $g.Checked = $on
     $g.Add_Click({
-        if (Guard-On) {
-            Run-Elevated "Stop-ScheduledTask -TaskName VPNGuard; Disable-ScheduledTask -TaskName VPNGuard; & '$Daemon' unlock" | Out-Null
+        if (Guard-On -Fresh) {
+            # сначала выключить задачу (её повтор раз в минуту поднял бы службу снова), потом
+            # остановить; unlock гасит и демона — Stop-ScheduledTask убивает только сторожа
+            Run-Elevated "Disable-ScheduledTask -TaskName VPNGuard; Stop-ScheduledTask -TaskName VPNGuard; & '$Daemon' unlock" | Out-Null
         } else {
             Run-Elevated "Enable-ScheduledTask -TaskName VPNGuard; Start-ScheduledTask -TaskName VPNGuard" | Out-Null
         }
+        [void](Guard-On -Fresh); & $refresh
     })
     [void]$menu.Items.Add($g)
 
@@ -313,11 +360,20 @@ function Rebuild-Menu {
 $menu.Add_Opening({ Rebuild-Menu })
 $ni.Add_DoubleClick({ Show-Picker })
 
+# Спокойный зелёный — только когда VPN подтверждён и сеть к Anthropic под фильтром.
+# Служба молчит при включённой охране — не контур «выключено», а оранжевый с «!».
+# (Подсказка NotifyIcon — не длиннее 63 символов.)
 $refresh = {
     $s = Read-Status
-    if (-not (Guard-On) -or (Is-Stale $s) -or -not @($s.apps).Count) { $ni.Icon = $IconOff; $ni.Text = 'Vafa: охрана выключена' }
-    elseif ($s.vpn) { $ni.Icon = $IconUp; $ni.Text = 'Vafa: VPN поднят' }
-    else { $ni.Icon = $IconDown; $ni.Text = 'Vafa: блокировка' }
+    if (-not (Guard-On)) { $ni.Icon = $IconOff; $ni.Text = 'Vafa: охрана выключена' }
+    elseif (Is-Stale $s) { $ni.Icon = $IconDead; $ni.Text = 'Vafa: служба не отвечает' }
+    else {
+        $st = State-Of $s
+        if ($st -eq 'down') { $ni.Icon = $IconDown; $ni.Text = $(if ($s.net_ok -eq $false) { 'Vafa: блокировка; сеть НЕ ЗАЩИЩЕНА' } else { 'Vafa: блокировка' }) }
+        elseif ($st -eq 'unsure') { $ni.Icon = $IconWarn; $ni.Text = 'Vafa: страна не подтверждена — сеть закрыта' }
+        elseif ($s.net_ok -eq $false) { $ni.Icon = $IconWarn; $ni.Text = 'Vafa: VPN поднят, сеть НЕ ЗАЩИЩЕНА' }
+        else { $ni.Icon = $IconUp; $ni.Text = 'Vafa: VPN поднят' }
+    }
 }
 & $refresh
 Rebuild-Menu

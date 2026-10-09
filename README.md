@@ -107,8 +107,12 @@ sudo vpn-guard uninstall   # удалить демон
 
 ```powershell
 & "C:\Program Files\VPNGuard\vpn-guard.ps1" status   # что сейчас происходит
-& "C:\Program Files\VPNGuard\vpn-guard.ps1" unlock   # аварийно снять блокировку
+& "C:\Program Files\VPNGuard\vpn-guard.ps1" unlock   # аварийно снять блокировку (выключает охрану)
 ```
+
+`unlock` выключает задачу Планировщика — охрана не вернётся сама, включить снова: в трее
+«Охрана включена» или `Enable-ScheduledTask VPNGuard`. Страну служба спрашивает и имена
+резолвит **только через туннель**; PPPoE («Высокоскоростное подключение») туннелем не считается.
 
 Удалить: в распакованной папке `windows` —
 

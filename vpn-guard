@@ -6,14 +6,21 @@
 #   * снимает бит +x с исполняемых файлов бандла — приложение не запускается НИЧЕМ:
 #     ни из Dock, ни из Spotlight, ни через `open -a`, ни прямым вызовом бинаря;
 #   * замораживает (SIGSTOP) или убивает уже запущенные процессы приложения;
-#   * (если задан BLOCK_NETS) через pf режет сеть к этим адресам мимо туннеля —
-#     так блокируется и сайт в любом браузере, и CLI.
+#   * (если задан BLOCK_NETS / BLOCK_HOSTS) через pf режет сеть к этим адресам мимо
+#     туннеля — так блокируется и сайт в любом браузере, и CLI.
 # Когда VPN поднимается — права возвращаются, процессы размораживаются.
+#
+# Сеть закрыта по умолчанию: при старте, на время перепроверки страны после события
+# сети и пока страна не подтверждена свежим ответом («не уверен» — сеть закрыта,
+# приложения не морозятся). Правила pf проверяются каждый круг и чинятся, если их
+# сбили снаружи (pfctl -d, очистка якоря).
 #
 # Подкоманды: daemon | status | check | lock | unlock | uninstall
 
 emulate -L zsh
 zmodload zsh/datetime
+zmodload -F zsh/stat b:zstat   # только zstat: встроенный stat заслонил бы /usr/bin/stat
+zmodload -F zsh/files b:zf_chmod b:zf_mv   # для status.json каждый круг — без отдельных процессов
 setopt no_nomatch
 set -u
 
@@ -24,8 +31,17 @@ PLIST=/Library/LaunchDaemons/local.vpnguard.plist
 
 # ---- значения по умолчанию (перекрываются конфигом) -------------------------
 typeset -ga APPS=()
-typeset -ga VPN_CHECK=( route )
-typeset -ga BLOCK_NETS=()
+typeset -ga VPN_CHECK=( route geo )
+# адреса Anthropic (проверено 2026-10-09: ARIN AP-2440, RIPEstat, platform.claude.com/docs/en/api/ip-addresses);
+# умолчание безопасное — если конфиг не прочитался, сеть всё равно под охраной
+typeset -ga BLOCK_NETS=( 160.79.104.0/21 2607:6bc0::/32 153.61.0.0/16 216.73.216.0/22
+                         38.46.212.0/24 38.84.152.0/24 209.249.57.0/24 )
+# имена вне этих сетей (облака, телеметрия): адреса берутся из DNS в фоне и копятся в таблице
+typeset -ga BLOCK_HOSTS=( downloads.claude.ai assets.claude.ai pivot.claude.ai
+                          a-cdn.anthropic.com s-cdn.anthropic.com
+                          o1158394.ingest.us.sentry.io
+                          http-intake.logs.us5.datadoghq.com browser-intake-us5-datadoghq.com
+                          logs.browser-intake-us5-datadoghq.com api-iam.intercom.io )
 typeset -ga BLOCK_COUNTRIES=( RU CN BY IR )   # страны, где VPN считается выключенным
 typeset -ga BAD_CC=()                         # действующий список (см. load_conf)
 VPN_REQUIRE=all      # all | any
@@ -37,14 +53,22 @@ GRACE=0
 NOTIFY=1
 GEO_TTL=1            # перепроверять страну выхода раз в столько секунд (VPN поднят)
 GEO_TTL_DOWN=1       # то же во время блокировки
-GEO_STALE=60
+GEO_STALE=60         # сколько секунд «не уверен» (сеть закрыта, приложения работают), потом блокировка
+GEO_BIND=${VPN_GUARD_GEO_BIND:-1}   # спрашивать страну через сам туннель (curl --interface utunN)
+HOSTS_TTL=300        # как часто перерезолвить BLOCK_HOSTS, секунд
+HOSTS_MAX=256        # сколько адресов BLOCK_HOSTS держать в таблице (старые вытесняются)
 NET_WATCH=1          # будить демон событиями сети (route -n monitor), а не только таймером
+PFCTL=${VPN_GUARD_PFCTL:-/sbin/pfctl}                 # подменяется в tests/run_macos.sh
+RESOLVER=${VPN_GUARD_RESOLVER:-"dscacheutil -q host -a name"}
+HOSTS_CACHE=$STATE_DIR/hosts.ips
 APPS_FILE=${VPN_GUARD_APPS:-/usr/local/etc/vpn-guard.apps}
 COUNTRIES_FILE=${VPN_GUARD_COUNTRIES:-/usr/local/etc/vpn-guard.countries}
 STATUS_FILE=$STATE_DIR/status.json
 
 typeset -gA TERMED=()
 typeset -gA WARNED=()
+typeset -gA LOGGED_T=()
+typeset -g CUR_IF=''   # интерфейс маршрута по умолчанию — один снимок на круг
 
 # ---- служебное --------------------------------------------------------------
 log() {
@@ -60,10 +84,26 @@ warn_once() {
   log "$*"
 }
 
+# то же, но не чаще раза в $2 секунд (для того, что может повторяться каждый круг)
+log_every() {
+  local key=$1 secs=$2; shift 2
+  local t=${LOGGED_T[$key]:-0}
+  (( EPOCHSECONDS - t >= secs || EPOCHSECONDS < t )) || return 0
+  LOGGED_T[$key]=$EPOCHSECONDS
+  log "$*"
+}
+
 die() { print -ru2 -- "vpn-guard: $*"; exit 1; }
 
 # VPN_GUARD_TEST=1 — только для tests/run.sh: демон без root на временных файлах
 need_root() { (( EUID == 0 )) || [[ ${VPN_GUARD_TEST:-} == 1 ]] || die "нужны права root — запусти через sudo"; }
+
+typeset -gA SKEY=()
+# то же в REPLY, с кэшем: md5 — отдельный процесс, а нужно каждый круг на каждое приложение
+state_key_r() {
+  [[ -n ${SKEY[$1]:-} ]] || SKEY[$1]=$(state_key $1)
+  REPLY=${SKEY[$1]}
+}
 
 state_key() {
   local app=$1 base h
@@ -89,6 +129,14 @@ notify() {
   return 0
 }
 
+notify_every() {
+  local key=notify:$1 secs=$2 t; shift 2
+  t=${LOGGED_T[$key]:-0}
+  (( EPOCHSECONDS - t >= secs || EPOCHSECONDS < t )) || return 0
+  LOGGED_T[$key]=$EPOCHSECONDS
+  notify "$@"
+}
+
 # ---- конфиг -----------------------------------------------------------------
 conf_is_safe() {
   local f=$1 owner mode
@@ -108,6 +156,7 @@ conf_is_safe() {
 }
 
 validate_conf() {
+  setopt local_options extended_glob   # шаблоны с # и ## — без него молча не совпадают
   [[ $VPN_REQUIRE == (all|any) ]] || { log "VPN_REQUIRE=$VPN_REQUIRE — беру all"; VPN_REQUIRE=all }
   [[ $ON_DOWN == (freeze|kill) ]] || { log "ON_DOWN=$ON_DOWN — беру freeze"; ON_DOWN=freeze }
   [[ $INTERVAL == <1-3600> ]]     || { log "INTERVAL=$INTERVAL — беру 1"; INTERVAL=1 }
@@ -115,7 +164,68 @@ validate_conf() {
   [[ $GEO_TTL_DOWN == <1-3600> ]] || { log "GEO_TTL_DOWN=$GEO_TTL_DOWN — беру 1"; GEO_TTL_DOWN=1 }
   [[ $GEO_STALE == <0-3600> ]]    || { log "GEO_STALE=$GEO_STALE — беру 60"; GEO_STALE=60 }
   [[ $GRACE == <0-3600> ]]        || { log "GRACE=$GRACE — беру 0"; GRACE=0 }
+  [[ $HOSTS_TTL == <30-86400> ]]  || { log "HOSTS_TTL=$HOSTS_TTL — беру 300"; HOSTS_TTL=300 }
+  [[ $HOSTS_MAX == <1-4096> ]]    || { log "HOSTS_MAX=$HOSTS_MAX — беру 256"; HOSTS_MAX=256 }
   (( ${#VPN_CHECK} )) || { log "VPN_CHECK пуст — беру route"; VPN_CHECK=( route ) }
+  # 0/1: под set -u «LOCK_LAUNCH=yes» в (( )) — обращение к переменной yes, и блокировка
+  # запуска молча выключалась
+  local v d
+  for v d in LOCK_LAUNCH 1 NOTIFY 1 NET_WATCH 1 MATCH_ANY_PATH 0 GEO_BIND 1; do
+    [[ ${(P)v:-} == (0|1) ]] || { log "$v=${(P)v:-} — беру $d"; typeset -g $v=$d }
+  done
+  # одна кривая запись в таблице pf роняет загрузку всех правил — такие выкидываем;
+  # имя хоста в BLOCK_NETS (старые конфиги — pf резолвил его сам) переезжает в BLOCK_HOSTS
+  local n h; local -a ok=()
+  for n in $BLOCK_NETS[@]; do
+    if net_is_valid $n && net_pf_ok $n; then (( ${ok[(Ie)$REPLY]} )) || ok+=( $REPLY )
+    elif host_is_valid $n; then BLOCK_HOSTS+=( $n ); warn_once "nethost:$n" "BLOCK_NETS: «$n» — имя, беру в BLOCK_HOSTS"
+    else warn_once "badnet:$n" "BLOCK_NETS: пропускаю непонятную запись «$n»"; fi
+  done
+  BLOCK_NETS=( $ok[@] ); ok=()
+  for h in $BLOCK_HOSTS[@]; do
+    if host_is_valid $h; then (( ${ok[(Ie)${(L)h}]} )) || ok+=( ${(L)h} )
+    else warn_once "badhost:$h" "BLOCK_HOSTS: пропускаю непонятное имя «$h»"; fi
+  done
+  BLOCK_HOSTS=( $ok[@] )
+}
+
+host_is_valid() {
+  setopt local_options extended_glob
+  [[ $1 == [A-Za-z0-9]([A-Za-z0-9.-]#)[A-Za-z0-9] && $1 == *.* && $1 != *..* && $1 == *[A-Za-z]* ]]
+}
+
+# IPv4/IPv6 адрес или сеть в записи CIDR — то, что можно отдать в таблицу pf
+net_is_valid() {
+  setopt local_options extended_glob   # шаблоны с # и ## — без него молча не совпадают
+  local a=${1%%/*} len=''
+  [[ $1 == */* ]] && len=${1#*/}
+  if [[ $a == <0-255>.<0-255>.<0-255>.<0-255> ]]; then
+    [[ -z $len || $len == <0-32> ]]
+  elif [[ $a == *:*:* && $a == [0-9A-Fa-f:]## ]]; then
+    # не больше одного «::», группы по 1–4 цифры, всего групп ≤ 8
+    [[ $a == *:::* || $a == *::*::* || $a == :[^:]* || $a == *[^:]: ]] && return 1
+    local -a g=( ${(s.:.)a} ); local x
+    for x in $g; do (( ${#x} <= 4 )) || return 1; done
+    if [[ $a == *::* ]]; then (( ${#g} <= 7 )) || return 1; else (( ${#g} == 8 )) || return 1; fi
+    [[ -z $len || $len == <0-128> ]]
+  else
+    return 1
+  fi
+}
+
+# Окончательная проверка — настоящим парсером pf (без root, ядро не трогает): то, что он
+# не примет, уронило бы загрузку всего якоря, и в ядре остались бы старые правила.
+# В REPLY — запись в том виде, в каком её хранит pf (/32 убирает, 160.79.105.0/21 →
+# 160.79.104.0/21, IPv6 строчными): иначе дубль в таблице pf схлопывает, число адресов не
+# сходится, и демон считал бы загрузку сбоем.
+net_pf_ok() {
+  REPLY=$1
+  [[ -x /sbin/pfctl ]] || return 0
+  local out
+  out=$(print -r -- "table <t> const { $1 }" | /sbin/pfctl -nvf - 2>/dev/null) || return 1
+  out=${${out#*\{ }%% \}*}
+  [[ -n $out && $out != *' '* ]] && REPLY=$out
+  return 0
 }
 
 # Список приложений из мини-приложения (Vafa.app). Если файл есть — он главнее
@@ -123,6 +233,7 @@ validate_conf() {
 # /Applications или ~/Applications, без «..» — демон от root делает chmod по этим
 # путям, так что произвольный путь сюда пускать нельзя.
 load_apps_file() {
+  setopt local_options extended_glob   # шаблоны с # и ## — без него молча не совпадают
   [[ -e $APPS_FILE ]] || return 1
   conf_is_safe $APPS_FILE || return 1
   local line; local -a out=()
@@ -141,19 +252,28 @@ load_apps_file() {
 # Страны блокировки из Vafa.app: одна строка — один двухбуквенный код (RU, CN…).
 # Пустой файл — страну не проверять. Печатает список; код 1 — файла нет.
 load_countries_file() {
+  setopt local_options extended_glob   # шаблоны с # и ## — без него молча не совпадают
   [[ -e $COUNTRIES_FILE ]] || return 1
   conf_is_safe $COUNTRIES_FILE || return 1
-  local line; local -a out=()
+  local line cc data=0; local -a out=()
   while IFS= read -r line || [[ -n $line ]]; do
-    line=${line//[[:space:]]/}
-    [[ -z $line || $line == \#* ]] && continue
-    line=${(U)line}
-    if [[ $line == [A-Z][A-Z] ]]; then
-      (( ${out[(I)$line]} )) || out+=( $line )
-    else
-      warn_once "badcc:$line" "в $COUNTRIES_FILE пропускаю непонятный код страны: $line"
-    fi
+    [[ $line == [[:space:]]#\#* ]] && continue
+    # «RU, CN» в одной строке — тоже понимаем
+    for cc in ${(s: :)${line//[,;[:space:]]/ }}; do
+      (( data++ ))
+      cc=${(U)cc}
+      if [[ $cc == [A-Z][A-Z] ]]; then
+        (( ${out[(Ie)$cc]} )) || out+=( $cc )
+      else
+        warn_once "badcc:$cc" "в $COUNTRIES_FILE пропускаю непонятный код страны: $cc"
+      fi
+    done
   done < $COUNTRIES_FILE
+  # в файле что-то написано, но ни одного годного кода — это порча, а не «не проверять страну»
+  if (( data && ! ${#out} )); then
+    warn_once "ccgarbage" "в $COUNTRIES_FILE нет ни одного годного кода страны — беру список по умолчанию"
+    return 1
+  fi
   BAD_CC=( $out[@] )
   return 0
 }
@@ -176,39 +296,74 @@ pick_bad_countries() {
 
 geo_rule_on() { (( ${VPN_CHECK[(I)geo(|:*)]} )) }
 
+# Конфиг не прочитался — остаются прежние значения (при старте — безопасные умолчания:
+# route+geo и сеть к Anthropic под охраной). Раньше здесь обнулялся список приложений,
+# и испорченный конфиг снимал всю защиту.
+typeset -g CONF_OK=0 APPS_OK=0
 load_conf() {
+  CONF_OK=0 APPS_OK=0
   if conf_is_safe $CONF; then
-    source $CONF
+    CONF_OK=1
+    source $CONF || log_every confsrc 60 "в $CONF ошибка (source вернул $?) — часть настроек могла не примениться"
+    # старый конфиг: «BLOCK_NETS=() — сетевой блок выключен», про BLOCK_HOSTS не знает —
+    # значит, и имена не трогать
+    if (( ! ${#BLOCK_NETS} )) && ! grep -q '^[[:space:]]*BLOCK_HOSTS' $CONF 2>/dev/null; then
+      BLOCK_HOSTS=()
+    fi
   else
-    log "список приложений пуст — vpn-guard ничего не делает"
-    APPS=()
+    log_every confbad 60 "конфиг не прочитан — работаю с прежними настройками"
   fi
-  load_apps_file
+  if load_apps_file; then
+    APPS_OK=1
+  elif (( CONF_OK )); then
+    APPS_OK=1
+  elif [[ -r $STATE_DIR/apps.last ]] && conf_is_safe $STATE_DIR/apps.last; then
+    # ни конфига, ни файла от щита: последний годный список, иначе при старте с битым
+    # конфигом prune_stale_locks разблокировал бы всё
+    APPS=( ${(f)"$(<$STATE_DIR/apps.last)"} )
+    log_every appslast 600 "беру последний годный список приложений ($STATE_DIR/apps.last)"
+  fi
+  if (( APPS_OK )) && [[ -d $STATE_DIR && -w $STATE_DIR ]]; then
+    print -rl -- $APPS[@] > $STATE_DIR/apps.last.tmp 2>/dev/null && mv -f $STATE_DIR/apps.last.tmp $STATE_DIR/apps.last 2>/dev/null
+  fi
   validate_conf
   pick_bad_countries
 }
 
+# inode, mtime и размер (в REPLY): щит пишет файл через install — новый inode, так что
+# и два сохранения за одну секунду различимы. zstat — без отдельного процесса.
 conf_mtime() {
-  local f; local -a m=()
-  # inode, mtime с наносекундами и размер: щит пишет файл через install (новый inode),
-  # а одной секунды mtime мало — два сохранения подряд сливались в одно
-  for f in $CONF $APPS_FILE $COUNTRIES_FILE; do m+=( "$(stat -f '%i:%Fm:%z' -- $f 2>/dev/null || print 0)" ); done
-  print -r -- ${(j:/:)m}
+  local f; local -a m=(); local -A h
+  for f in $CONF $APPS_FILE $COUNTRIES_FILE; do
+    if zstat -H h -- $f 2>/dev/null; then m+=( "${h[inode]}:${h[mtime]}:${h[size]}" ); else m+=( 0 ); fi
+  done
+  REPLY=${(j:/:)m}
 }
 
 # ---- определение VPN --------------------------------------------------------
-_default_iface() {
-  route -n get default 2>/dev/null | awk '/interface: /{print $2; exit}'
+# VPN_GUARD_IFACE_FILE — только для tests/run_macos.sh: имя интерфейса берётся из файла
+# интерфейс маршрута по умолчанию — в REPLY (один процесс route, без awk и подоболочки)
+default_iface_r() {
+  REPLY=''
+  if [[ -n ${VPN_GUARD_IFACE_FILE:-} ]]; then
+    REPLY=$(<$VPN_GUARD_IFACE_FILE) 2>/dev/null
+    REPLY=${REPLY//[[:space:]]/}
+    return 0
+  fi
+  local out
+  out=$(route -n get default 2>/dev/null)
+  [[ $out == *'interface: '* ]] || return 0
+  out=${out#*interface: }
+  REPLY=${${out%%$'\n'*}//[[:space:]]/}
 }
+_default_iface() { default_iface_r; print -r -- $REPLY }
 
-_route_is_vpn() {
-  local i
-  i=$(_default_iface)
-  case $i in
-    (utun*|ppp*|ipsec*|tun*|tap*) return 0 ;;
-  esac
-  return 1
-}
+_is_tun() { [[ ${1:-} == (utun|ppp|ipsec|tun|tap)* ]] }
+
+# Интерфейс берётся один раз в начале круга (CUR_IF). Раньше vpn_up и выбор режима pf
+# спрашивали маршрут по отдельности с разницей в 1–3 с: vpn_up видел utun5, pf — уже en0,
+# и фильтр снимался совсем (режим open; в журнале 2026-09-25, 10-05, 10-06).
+_route_is_vpn() { _is_tun $CUR_IF }
 
 _nc_connected() {
   local want=$1
@@ -220,38 +375,62 @@ _nc_connected() {
 }
 
 # страна, из которой нас видит интернет (Cloudflare trace). Кэш на GEO_TTL секунд,
-# сбрасывается при смене интерфейса маршрута по умолчанию. Глобальные переменные,
-# потому что _one_check нельзя звать в подоболочке — кэш бы терялся.
+# сбрасывается при смене интерфейса маршрута по умолчанию и по событию сети.
+# Глобальные переменные, потому что _one_check нельзя звать в подоболочке — кэш бы терялся.
 #
-# Один неответивший запрос — ещё не повод блокировать: по журналу за 2026-09-11..28
+# Спрашиваем через сам туннель (curl --interface utunN): страна та же, что видит
+# Anthropic — pf к нему и так пускает только через туннель. Проверено 2026-10-09:
+# через utun5 — FR, через en0 — RU.
+#
+# Один неответивший запрос — ещё не повод морозить: по журналу за 2026-09-11..28
 # 372 из 441 блокировки были с «страна: ?» при живом туннеле, т.е. Cloudflare просто
-# не ответил за 4 с. Поэтому: до трёх попыток (второй адрес — по IP, мимо DNS), а
-# если все мимо — на том же интерфейсе ещё GEO_STALE секунд верим последнему ответу.
+# не ответил за 4 с. Поэтому: до трёх попыток (адреса по IP — мимо DNS), а если все
+# мимо — на том же интерфейсе ещё GEO_STALE секунд «не уверен»: сеть к Anthropic
+# закрыта, приложения не морозятся (GEO_UNSURE). Раньше в это время сеть была открыта.
 #
 # Как часто: раз в GEO_TTL с (по умолчанию каждую секунду; GEO_TTL_DOWN — при блокировке)
 # и сразу же — по событию сети (см. wait_tick). Запрос — 1 КБ, curl живёт доли секунды.
 typeset -g GEO_LAST_T=0 GEO_LAST_IF='' GEO_LAST_CC='' GEO_GOOD_T=0 GEO_GOOD_CC='' GUARD_DOWN=0
-typeset -ga GEO_URLS=( https://www.cloudflare.com/cdn-cgi/trace https://1.1.1.1/cdn-cgi/trace
+typeset -g GEO_FRESH=0 GEO_UNSURE=0
+typeset -ga GEO_URLS=( https://1.1.1.1/cdn-cgi/trace https://1.0.0.1/cdn-cgi/trace
                        https://www.cloudflare.com/cdn-cgi/trace )
-[[ -n ${VPN_GUARD_GEO_URLS:-} ]] && GEO_URLS=( ${=VPN_GUARD_GEO_URLS} )   # для tests/run.sh
+[[ -n ${VPN_GUARD_GEO_URLS:-} ]] && GEO_URLS=( ${=VPN_GUARD_GEO_URLS} )   # для tests/run_macos.sh
+# страна — в REPLY (curl без awk и подоболочки)
 _geo_fetch() {
-  curl -s --max-time 4 $1 2>/dev/null | awk -F= '$1=="loc"{print $2; exit}'
+  local -a opt=( -s --max-time 4 )
+  local out l
+  [[ -n ${2:-} ]] && opt+=( --interface $2 )
+  REPLY=''
+  out=$(curl $opt $1 2>/dev/null)
+  for l in ${(f)out}; do
+    [[ $l == loc=* ]] && { REPLY=${${l#loc=}//[^A-Za-z]/}; return 0 }
+  done
 }
 _geo_refresh() {
-  local i cc='' url ttl=$GEO_TTL
+  local i=$CUR_IF cc='' url ttl=$GEO_TTL bind='' d g
   (( GUARD_DOWN )) && ttl=$GEO_TTL_DOWN
-  i=$(_default_iface)
-  if (( EPOCHSECONDS - GEO_LAST_T >= ttl )) || [[ $i != $GEO_LAST_IF ]]; then
-    for url in $GEO_URLS[@]; do
-      cc=$(_geo_fetch $url)
-      [[ -n $cc ]] && break
-    done
+  d=$(( EPOCHSECONDS - GEO_LAST_T ))
+  # d < 0 — часы перевели назад: считать, что срок вышел
+  if (( d < 0 || d >= ttl )) || [[ $i != $GEO_LAST_IF ]]; then
+    # не через туннель — не спрашивать вовсе: запрос ушёл бы с настоящего адреса,
+    # а ответ и так известен (VPN нет)
+    if (( GEO_BIND )); then _is_tun $i && bind=$i; fi
+    if (( ! GEO_BIND )) || [[ -n $bind ]]; then
+      for url in $GEO_URLS[@]; do
+        _geo_fetch $url $bind; cc=$REPLY
+        [[ -n $cc ]] && break
+      done
+    fi
     [[ $i == $GEO_LAST_IF ]] || GEO_GOOD_T=0
+    g=$(( EPOCHSECONDS - GEO_GOOD_T ))
     if [[ -n $cc ]]; then
-      GEO_GOOD_T=$EPOCHSECONDS GEO_GOOD_CC=$cc
-    elif (( GEO_GOOD_T && EPOCHSECONDS - GEO_GOOD_T < GEO_STALE )); then
-      cc=$GEO_GOOD_CC
-      warn_once "geostale:$GEO_GOOD_T" "Cloudflare не ответил — пока верю прошлой стране $cc"
+      GEO_GOOD_T=$EPOCHSECONDS GEO_GOOD_CC=$cc GEO_FRESH=1
+    else
+      GEO_FRESH=0
+      if (( GEO_GOOD_T && g >= 0 && g < GEO_STALE )); then
+        cc=$GEO_GOOD_CC
+        warn_once "geostale:$GEO_GOOD_T" "Cloudflare не ответил — сеть к Anthropic закрыта, приложения не морожу (прошлая страна $cc)"
+      fi
     fi
     GEO_LAST_CC=$cc
     GEO_LAST_T=$EPOCHSECONDS
@@ -263,19 +442,22 @@ _geo_refresh() {
 #                свой список работает, только пока страны не выбраны в Vafa.app);
 # geo:FR,NL    — страна выхода из списка.
 # Нет ответа (нет сети, Cloudflare недоступен) — считаем, что VPN нет.
+# Прошло по старому ответу (Cloudflare молчит) — GEO_UNSURE=1.
 _geo_ok() {
   local spec=$1
   if [[ $spec == \!* ]]; then
     (( ${#BAD_CC} )) || return 0   # страны не выбраны — страну не проверяем
     _geo_refresh
     [[ -n $GEO_LAST_CC ]] || return 1
-    (( ${BAD_CC[(I)$GEO_LAST_CC]} )) && return 1
-    return 0
+    (( ${BAD_CC[(Ie)$GEO_LAST_CC]} )) && return 1
+  else
+    _geo_refresh
+    [[ -n $GEO_LAST_CC ]] || return 1
+    local -a good=( ${(s:,:)spec} )
+    (( ${good[(Ie)$GEO_LAST_CC]} )) || return 1
   fi
-  _geo_refresh
-  [[ -n $GEO_LAST_CC ]] || return 1
-  local -a good=( ${(s:,:)spec} )
-  (( ${good[(I)$GEO_LAST_CC]} ))
+  (( GEO_FRESH )) || GEO_UNSURE=1
+  return 0
 }
 
 _one_check() {
@@ -287,15 +469,17 @@ _one_check() {
     (scutil)    _nc_connected '' ;;
     (nc:*)      _nc_connected "${rule#nc:}" ;;
     (iface:*)   ifconfig ${rule#iface:} 2>/dev/null | grep -q 'inet ' ;;
-    (default-iface:*) [[ $(_default_iface) == ${rule#default-iface:} ]] ;;
+    (default-iface:*) [[ $CUR_IF == ${rule#default-iface:} ]] ;;
     (proc:*)    pgrep -x -- ${rule#proc:} >/dev/null 2>&1 ;;
     (script:*)  ${rule#script:} >/dev/null 2>&1 ;;
     (*)         warn_once "rule:$rule" "неизвестное правило VPN_CHECK: $rule — считаю его невыполненным"; return 1 ;;
   esac
 }
 
+# 0 — VPN есть (GEO_UNSURE=1 — но страна не подтверждена свежим ответом), 1 — нет
 vpn_up() {
-  local rule ok
+  local rule
+  GEO_UNSURE=0
   if [[ $VPN_REQUIRE == all ]]; then
     for rule in $VPN_CHECK[@]; do
       _one_check $rule || return 1
@@ -303,6 +487,7 @@ vpn_up() {
     return 0
   else
     for rule in $VPN_CHECK[@]; do
+      GEO_UNSURE=0
       _one_check $rule && return 0
     done
     return 1
@@ -315,28 +500,50 @@ app_exe_names() {
   for f in $d/*(.N); do print -r -- ${f:t}; done
 }
 
-app_pids() {
-  local app=$1
-  local prefix=$app/Contents/
-  local -a names=()
+# Снимок процессов — один ps на круг. Раньше ps запускался на каждый процесс приложения,
+# дважды за круг (у Claude.app их ~33). PS_SNAP — строки «pid stat comm»; после
+# заморозки/разморозки PS_DIRTY=1 — status.json возьмёт свежий снимок.
+# ps -axww — самое дорогое в круге (~28 мс процессора), поэтому при устойчивом «VPN есть»
+# снимок раз в PS_EVERY с, а при блокировке и при смене состояния — каждый круг.
+typeset -g PS_SNAP='' PS_DIRTY=0 PS_T=0 PS_EVERY=5
+typeset -gA APC=()   # разбор снимка по приложениям — до следующего снимка
+ps_snap() { PS_SNAP=$(ps -axww -o pid=,stat=,comm= 2>/dev/null); PS_DIRTY=0 PS_T=$EPOCHSECONDS; APC=() }
+
+# процессы приложения из снимка: строки «pid stat»
+# процессы приложения из снимка — в массив reply («pid stat»), без подоболочки и конвейера
+app_procs_r() {
+  setopt local_options extended_glob
+  local app=$1 prefix=$1/Contents/ line rest
+  local -a names=() w
+  reply=()
+  [[ -n $PS_SNAP ]] || ps_snap
+  if (( ${+APC[$app]} )); then reply=( ${(f)APC[$app]} ); return 0; fi
   (( MATCH_ANY_PATH )) && names=( ${(f)"$(app_exe_names $app)"} )
-  local pid rest
-  ps -axww -o pid=,comm= | while read -r pid rest; do
-    [[ -n $rest ]] || continue
-    if [[ $rest == $prefix* ]]; then
-      print -r -- $pid
-      continue
-    fi
-    if (( MATCH_ANY_PATH )) && (( ${names[(I)${rest:t}]} )); then
-      print -r -- $pid
+  for line in ${(f)PS_SNAP}; do
+    (( MATCH_ANY_PATH )) || [[ $line == *" $prefix"* ]] || continue
+    w=( ${=line} )
+    (( ${#w} >= 3 )) || continue
+    rest=${line##[[:space:]]#[0-9]##[[:space:]]##[^[:space:]]##[[:space:]]##}
+    if [[ $rest == $prefix* ]] || { (( MATCH_ANY_PATH )) && (( ${names[(Ie)${rest:t}]} )) }; then
+      reply+=( "$w[1] $w[2]" )
     fi
   done
+  APC[$app]=${(F)reply}
+}
+
+app_procs() { app_procs_r $1; print -rl -- $reply[@] }
+
+app_pids() {
+  local l
+  app_procs_r $1
+  for l in $reply[@]; do print -r -- ${l%% *}; done
 }
 
 lock_app() {
   local app=$1
   local exedir=$app/Contents/MacOS
-  local stfile=$PERM_DIR/$(state_key $app)
+  state_key_r $app
+  local stfile=$PERM_DIR/$REPLY
   if [[ ! -d $exedir ]]; then
     warn_once "noexe:$app" "не нашёл $exedir — проверь путь в конфиге"
     return 1
@@ -357,19 +564,31 @@ lock_app() {
   fi
 
   local f mode changed=0 failed=0
+  local -a todo=()
   for f in $files[@]; do
     mode=$(stat -f '%OLp' -- $f 2>/dev/null) || continue
-    (( 8#$mode & 0111 )) || continue
+    (( 8#$mode & 8#111 )) || continue   # 0111 без octal_zeroes — это десятичное 111
     [[ -n ${saved[$f]:-} ]] || saved[$f]=$mode
+    todo+=( $f )
+  done
+  (( ${#todo} )) || return 0   # исполняемых не осталось — уже заблокировано
+
+  # сначала записать, какие были права (атомарно), и только потом снимать +x:
+  # при полном диске раньше chmod проходил, а файл состояния — нет, и +x не возвращался
+  mkdir -p $PERM_DIR
+  if ! { { print -r -- "# app: $app"
+           for p in ${(k)saved}; do printf '%s\t%s\n' ${saved[$p]} $p; done
+         } > $stfile.tmp && mv -f $stfile.tmp $stfile } 2>/dev/null; then
+    rm -f $stfile.tmp
+    log_every "nostate:$app" 60 "не смог записать $stfile — запуск $app не блокирую (только заморозка)"
+    return 1
+  fi
+
+  for f in $todo[@]; do
     if chmod a-x $f 2>/dev/null; then changed=1; else failed=1; fi
   done
-
-  if (( ${#saved} )); then
-    mkdir -p $PERM_DIR
-    { print -r -- "# app: $app"
-      for p in ${(k)saved}; do printf '%s\t%s\n' ${saved[$p]} $p; done
-    } > $stfile
-  fi
+  # macOS не дал снять +x ни с одного файла — «заблокировано» было бы враньём в status.json
+  (( had_state == 0 && changed == 0 )) && rm -f $stfile
 
   if (( had_state == 0 )); then
     (( changed )) && log "заблокирован запуск: $app"
@@ -380,7 +599,8 @@ lock_app() {
 
 unlock_app() {
   local app=$1
-  local stfile=$PERM_DIR/$(state_key $app)
+  state_key_r $app
+  local stfile=$PERM_DIR/$REPLY
   [[ -e $stfile ]] || return 0
   local m p
   while IFS=$'\t' read -r m p; do
@@ -394,23 +614,23 @@ unlock_app() {
 }
 
 freeze_app() {
-  local app=$1 pid st
-  for pid in ${(f)"$(app_pids $app)"}; do
-    [[ -n $pid ]] || continue
-    st=$(ps -o state= -p $pid 2>/dev/null)
-    [[ $st == T* ]] && continue
-    kill -STOP $pid 2>/dev/null && log "заморожен процесс $pid (${app:t})"
+  local app=$1 l pid
+  app_procs_r $app
+  for l in $reply[@]; do
+    pid=${l%% *}
+    [[ ${l#* } == T* ]] && continue
+    kill -STOP $pid 2>/dev/null && { log "заморожен процесс $pid (${app:t})"; PS_DIRTY=1 }
   done
   return 0
 }
 
 resume_app() {
-  local app=$1 pid st
-  for pid in ${(f)"$(app_pids $app)"}; do
-    [[ -n $pid ]] || continue
-    st=$(ps -o state= -p $pid 2>/dev/null)
-    [[ $st == T* ]] || continue
-    kill -CONT $pid 2>/dev/null && log "разморожен процесс $pid (${app:t})"
+  local app=$1 l pid
+  app_procs_r $app
+  for l in $reply[@]; do
+    pid=${l%% *}
+    [[ ${l#* } == T* ]] || continue
+    kill -CONT $pid 2>/dev/null && { log "разморожен процесс $pid (${app:t})"; PS_DIRTY=1 }
   done
   return 0
 }
@@ -420,10 +640,10 @@ kill_app() {
   for pid in ${(f)"$(app_pids $app)"}; do
     [[ -n $pid ]] || continue
     if [[ -n ${TERMED[$pid]:-} ]]; then
-      kill -KILL $pid 2>/dev/null && log "убит процесс $pid (${app:t}, SIGKILL)"
+      kill -KILL $pid 2>/dev/null && { log "убит процесс $pid (${app:t}, SIGKILL)"; PS_DIRTY=1 }
     else
       TERMED[$pid]=1
-      kill -TERM $pid 2>/dev/null && log "закрываю процесс $pid (${app:t}, SIGTERM)"
+      kill -TERM $pid 2>/dev/null && { log "закрываю процесс $pid (${app:t}, SIGTERM)"; PS_DIRTY=1 }
     fi
   done
   return 0
@@ -432,135 +652,377 @@ kill_app() {
 # ---- сетевой блок через pf --------------------------------------------------
 # Якорь внутри com.apple/* — он уже подключён в штатном /etc/pf.conf,
 # поэтому системный конфиг править не нужно.
-PF_ANCHOR=com.apple/vpn-guard
-PF_CUR=''
+#
+# Режимы (PF_CUR):
+#   block      — к адресам нельзя никак (VPN нет); открытые соединения рвутся;
+#   hold       — те же правила, но соединения не рвём: «не уверен» — старт демона,
+#                перепроверка страны после события сети, Cloudflare молчит, GRACE;
+#   via:utunN  — можно только через этот туннель (падение VPN режется мгновенно,
+#                не дожидаясь следующего опроса). Состояния привязаны к интерфейсу
+#                (if-bound): по умолчанию в pf они «плавающие» (man pf.conf), и уже
+#                открытое через туннель соединение могло выйти через en0.
+# Режима «правил нет» (open) больше нет: если VPN признан поднятым без туннеля
+# (правила scutil/proc/… вместо route) — напрямую к адресам нельзя, только через прокси.
+#
+# Каждый круг pf_apply сверяет то, что реально загружено (pf_verify), а не только
+# смену режима: pf могли выключить (pfctl -d у другого VPN-клиента обнуляет все
+# ссылки -E), очистить якорь или основной набор правил.
+# Имя «000.…»: дочерние якоря com.apple/* pf перебирает по алфавиту, и наш должен идти
+# раньше чужих (200.AirDrop, 250.ApplicationFirewall, якоря других программ) — иначе
+# чей-то «pass … quick» сработал бы первым. Старое имя чистится при старте.
+PF_ANCHOR=com.apple/000.vpn-guard
+PF_ANCHOR_OLD=com.apple/vpn-guard
+typeset -g PF_CUR='' PF_WANT='' PF_OK=0 PF_ERR='' PF_SHOWN='' PF_RELOAD=0 PF_FB=0 PF_KILL_CYCLE=-1
+typeset -ga HOST_IPS=()
+# Адреса имён из BLOCK_HOSTS на 2026-10-09 (dig): чтобы таблица не была пустой, пока
+# DNS ещё не ответил или отдаёт fake-IP прокси (198.18/15). Это балансировщики Datadog
+# us5, Sentry US и Google Cloud под Anthropic — чужим сайтам не мешают.
+typeset -gA HOSTS_SEED=(
+  downloads.claude.ai                    35.190.46.17
+  assets.claude.ai                       34.120.108.227
+  pivot.claude.ai                        34.50.145.103
+  a-cdn.anthropic.com                    34.36.57.103
+  s-cdn.anthropic.com                    34.54.194.141
+  o1158394.ingest.us.sentry.io           "34.160.81.0 2600:1901:0:5e8a::"
+  http-intake.logs.us5.datadoghq.com     "34.149.66.165 2600:1901:0:9e23::"
+  browser-intake-us5-datadoghq.com       "34.149.66.163 2600:1901:0:5ae7::"
+  logs.browser-intake-us5-datadoghq.com  34.149.66.163
+)
+
+pf_entries() {
+  local -a e=( $BLOCK_NETS[@] $HOST_IPS[@] )
+  local h
+  for h in $BLOCK_HOSTS[@]; do e+=( ${=HOSTS_SEED[$h]:-} ); done
+  print -rl -- ${(u)e[@]}
+}
 
 pf_rules() {
   local via=${1:-}
-  print -r -- "table <vpnguard> const { ${(j:, :)BLOCK_NETS} }"
-  [[ -n $via ]] && print -r -- "pass out quick on $via to <vpnguard>"
+  print -r -- "table <vpnguard> const { ${(j:, :)${(f)"$(pf_entries)"}} }"
+  [[ -n $via ]] && print -r -- "pass out quick on $via to <vpnguard> keep state (if-bound)"
+  print -r -- "block return out quick to <vpnguard>"
+}
+
+# Запасной набор, если основной не загрузился: только block, сети — встроенные в демон.
+# Главное — чтобы в ядре не остался старый «pass … on utunN» (pfctl при ошибке
+# оставляет прежние правила как есть).
+typeset -ga PF_FALLBACK_NETS=( 160.79.104.0/21 2607:6bc0::/32 153.61.0.0/16 216.73.216.0/22
+                               38.46.212.0/24 38.84.152.0/24 209.249.57.0/24 )
+pf_rules_fallback() {
+  print -r -- "table <vpnguard> const { ${(j:, :)PF_FALLBACK_NETS} }"
   print -r -- "block return out quick to <vpnguard>"
 }
 
 pf_enable() {
   # после перезагрузки pf выключен, а старый токен остаётся на диске —
   # поэтому смотреть на реальный статус, а не на наличие файла
-  if [[ -s $STATE_DIR/pf.token ]] && pfctl -s info 2>/dev/null | grep -q 'Status: Enabled'; then
+  if [[ -s $STATE_DIR/pf.token && "$($PFCTL -s info 2>/dev/null)" == *'Status: Enabled'* ]]; then
     return 0
   fi
   rm -f $STATE_DIR/pf.token
   local tok
-  tok=$(pfctl -E 2>&1 | awk '/[Tt]oken/{print $NF; exit}')
+  tok=$($PFCTL -E 2>&1 | awk '/[Tt]oken/{print $NF; exit}')
   [[ -n $tok ]] && print -r -- $tok > $STATE_DIR/pf.token
+  return 0
+}
+
+# Основной набор правил очистили целиком (pfctl -F all) — с ним пропала и точка
+# подключения com.apple/*, где висят наши правила. Штатный /etc/pf.conf возвращаем,
+# только если основной набор пуст: чужие правила (другой VPN-клиент) не трогаем.
+# точка подключения — целая строка: подстрока совпала бы и с scrub-anchor "com.apple/*"
+pf_main_has_anchor() { [[ ${(F)${(f)1}} == (|*$'\n')'anchor "com.apple/*" all'(|$'\n'*) ]] }
+
+pf_attach() {
+  local main
+  main=$($PFCTL -s rules 2>/dev/null)
+  pf_main_has_anchor "$main" && return 0
+  if [[ -z ${main//[[:space:]]/} ]] && grep -qF 'anchor "com.apple/*"' /etc/pf.conf 2>/dev/null; then
+    $PFCTL -f /etc/pf.conf >/dev/null 2>&1 &&
+      log "основной набор pf был пуст — загрузил /etc/pf.conf (точка подключения com.apple/*)"
+  fi
+  return 0
+}
+
+# Правила реально действуют? pf включён, точка com.apple/* подключена, в нашем якоре
+# ровно то, что нужно режиму. Причина отказа — в PF_ERR.
+pf_verify() {
+  local mode=$1 r line np=0 nb=0 okp=0
+  PF_OK=0
+  if [[ "$($PFCTL -s info 2>/dev/null)" != *'Status: Enabled'* ]]; then PF_ERR='pf выключен'; return 1; fi
+  local main ml
+  main=$($PFCTL -s rules 2>/dev/null)
+  if ! pf_main_has_anchor "$main"; then
+    PF_ERR='точка подключения com.apple/* пропала из pf'; return 1
+  fi
+  # чужое «pass … quick» в основном наборе ДО точки подключения — наш якорь не дойдёт до дела
+  for ml in ${(f)main}; do
+    [[ $ml == 'anchor "com.apple/*" all' ]] && break
+    [[ $ml == pass*' quick'* ]] && { PF_ERR="в основном наборе pf до com.apple/* чужой пропуск: $ml"; return 1 }
+  done
+  r=$($PFCTL -a $PF_ANCHOR -s rules 2>/dev/null)
+  for line in ${(f)r}; do
+    case $line in
+      ('block return out quick from any to <vpnguard>'*) (( nb++ )) ;;
+      (pass*) (( np++ ))
+              [[ $mode == via:* && $line == "pass out quick on ${mode#via:} from any to <vpnguard> "*'(if-bound)'* ]] && okp=1 ;;
+    esac
+  done
+  if (( nb != 1 )); then PF_ERR='в якоре pf нет правила block'; return 1; fi
+  if [[ $mode == via:* ]]; then
+    (( np == 1 && okp )) || { PF_ERR="в якоре pf нет пропуска через ${mode#via:}"; return 1 }
+  else
+    (( np == 0 )) || { PF_ERR='в якоре pf лишний пропуск'; return 1 }
+  fi
+  PF_OK=1 PF_ERR=''
   return 0
 }
 
 pf_kill_states() {
   local n any
-  for n in $BLOCK_NETS[@]; do
+  PF_KILL_CYCLE=$CYCLE_N
+  for n in ${(f)"$(pf_entries)"}; do
     [[ $n == *:* ]] && any=::/0 || any=0.0.0.0/0
-    pfctl -k $any -k $n >/dev/null 2>&1
+    $PFCTL -k $any -k $n >/dev/null 2>&1
   done
   return 0
 }
 
-# block      — к BLOCK_NETS нельзя никак
-# via:utunN  — можно только через этот туннель (падение VPN режется мгновенно,
-#              не дожидаясь следующего опроса)
-# open       — правил нет (VPN признан поднятым, но маршрут не через туннель)
-pf_apply() {
+pf_say() {
   local mode=$1
-  (( ${#BLOCK_NETS} )) || return 0
-  [[ $mode == $PF_CUR ]] && return 0
-  if [[ $mode == open ]]; then
-    pfctl -a $PF_ANCHOR -F all >/dev/null 2>&1
-    PF_CUR=open
-    log "сеть к заблокированным адресам: открыта (маршрут не через туннель)"
+  [[ $mode == hold || $mode == $PF_SHOWN ]] && return 0
+  PF_SHOWN=$mode
+  case $mode in
+    (block) log "сеть к заблокированным адресам: ЗАКРЫТА" ;;
+    (via:*) log "сеть к заблокированным адресам: только через ${mode#via:}" ;;
+  esac
+}
+
+pf_apply() {
+  local mode=$1 via='' n_want n_have
+  PF_WANT=$mode
+  if (( ! ${#BLOCK_NETS} && ! ${#BLOCK_HOSTS} )); then
+    # снять правила, даже если PF_CUR пуст (старт демона, после запасного набора)
+    [[ $PF_CUR == off ]] || { pf_off; log "BLOCK_NETS и BLOCK_HOSTS пусты — сетевой блок выключен" }
+    PF_CUR=off PF_WANT=off PF_OK=0 PF_ERR='BLOCK_NETS пуст — сеть не защищена' PF_FB=0
     return 0
   fi
+  if [[ $mode == $PF_CUR ]] && (( ! PF_RELOAD )); then
+    pf_verify $mode && return 0
+    log_every "pfbroken:$PF_ERR" 60 "pf: защиту сбили снаружи ($PF_ERR) — восстанавливаю"
+    notify_every pfbroken 600 "Сетевой фильтр сбит" "$PF_ERR — восстанавливаю"
+  fi
   pf_enable
-  local via=''
+  pf_attach
   [[ $mode == via:* ]] && via=${mode#via:}
   # "$via" в кавычках: пустая строка без кавычек в zsh исчезает совсем,
   # pf_rules падал на set -u и в pf уходил ПУСТОЙ набор правил
-  pf_rules "$via" | pfctl -a $PF_ANCHOR -f - >/dev/null 2>&1
+  local loaded=1
+  pf_rules "$via" | $PFCTL -a $PF_ANCHOR -f - >/dev/null 2>&1 || loaded=0
+  if (( loaded )); then
+    # в таблице столько адресов, сколько отдали? (pfctl при ошибке оставляет старую)
+    n_want=${#${(f)"$(pf_entries)"}}
+    n_have=${#${(f)"$($PFCTL -a $PF_ANCHOR -t vpnguard -T show 2>/dev/null)"}}
+    (( n_have == n_want )) || { loaded=0; PF_ERR="в таблице pf $n_have адресов из $n_want" }
+  else
+    PF_ERR="pfctl не принял правила ($mode)"
+  fi
+  if (( ! loaded )); then
+    # главное — не оставить в ядре старый пропуск через туннель
+    pf_rules_fallback | $PFCTL -a $PF_ANCHOR -f - >/dev/null 2>&1
+    (( PF_FB )) || pf_kill_states   # рвать — при входе в запасной набор, а не каждый круг
+    log_every "pfload:$PF_ERR" 60 "pf: $PF_ERR — загрузил запасной набор (только block, встроенные сети)"
+    notify_every pfload 600 "Сетевой фильтр не работает" "$PF_ERR"
+    PF_ERR="запасной набор (закрыто всё): $PF_ERR"
+    PF_CUR='' PF_OK=0 PF_RELOAD=0 PF_FB=1
+    return 0
+  fi
   # код возврата pfctl не доказывает, что правила на месте — проверить глазами
-  if pfctl -a $PF_ANCHOR -s rules 2>/dev/null | grep -q '^block'; then
-    PF_CUR=$mode
-    if [[ -n $via ]]; then
-      log "сеть к заблокированным адресам: только через $via"
-    else
-      log "сеть к заблокированным адресам: ЗАКРЫТА"
-    fi
-    pf_kill_states   # оборвать уже открытые соединения
+  if pf_verify $mode; then
+    if [[ -n $via ]]; then tun_id_r $via; TUN_ID=$REPLY; TUN_IDX=${${REPLY#*|}%%|*}; fi
+    PF_CUR=$mode PF_RELOAD=0 PF_FB=0
+    pf_say $mode
+    # рвать открытые соединения — только когда VPN точно нет. В hold и на туннеле
+    # соединения живут: те, что шли через туннель, привязаны к нему (if-bound)
+    [[ $mode == block ]] && pf_kill_states
   else
     PF_CUR=''   # повторить на следующем круге
-    warn_once pfload "не удалось загрузить правила pf в $PF_ANCHOR — проверь BLOCK_NETS"
+    log_every "pfload:$PF_ERR" 60 "pf: правила не встали ($mode): $PF_ERR"
+    notify_every pfload 600 "Сетевой фильтр не работает" "$PF_ERR"
   fi
   return 0
 }
 
 pf_off() {
-  pfctl -a $PF_ANCHOR -F all >/dev/null 2>&1
+  $PFCTL -a $PF_ANCHOR -F all >/dev/null 2>&1
+  $PFCTL -a $PF_ANCHOR_OLD -F all >/dev/null 2>&1
   if [[ -s $STATE_DIR/pf.token ]]; then
-    pfctl -X $(<$STATE_DIR/pf.token) >/dev/null 2>&1
+    $PFCTL -X $(<$STATE_DIR/pf.token) >/dev/null 2>&1
     rm -f $STATE_DIR/pf.token
   fi
-  PF_CUR=''
+  PF_CUR='' PF_SHOWN='' PF_OK=0
   return 0
 }
 
+# VPN признан поднятым: через туннель — можно, иначе напрямую к адресам нельзя.
+# Ответ — в REPLY: в $(…) log печатал бы в ответ, а log_every терял бы метку времени.
 pf_mode_when_up() {
-  local i
-  i=$(_default_iface)
-  case $i in
-    (utun*|ppp*|ipsec*|tun*|tap*) print -r -- "via:$i" ;;
-    (*) print -r -- open ;;
-  esac
+  if _is_tun $CUR_IF; then
+    REPLY="via:$CUR_IF"
+  else
+    log_every notun 600 "VPN признан поднятым, но маршрут не через туннель ($CUR_IF) — напрямую к Anthropic нельзя, только через прокси"
+    REPLY=block
+  fi
 }
 
-# Состояние для Vafa.app: демон пишет его на каждом круге, приложение читает
-# без sudo. Только чтение — управлять демоном через этот файл нельзя.
+# ---- BLOCK_HOSTS: адреса из DNS -----------------------------------------------
+# Часть адресов Anthropic и её телеметрии живёт вне BLOCK_NETS: облака Google,
+# Sentry, Datadog (замер 2026-10-09: Claude Code держит постоянное соединение с
+# http-intake.logs.us5.datadoghq.com). pf понимает только адреса, поэтому имена
+# резолвятся в фоне (DNS может висеть секундами — круг ждать не должен), адреса
+# копятся в $HOSTS_CACHE (объединение не больше HOSTS_MAX: балансировщики меняют
+# адреса, а приложение могло запомнить старый) и уходят в ту же таблицу pf.
+# Цена: при выключенном VPN Datadog/Sentry/Intercom недоступны и другим программам.
+# Локальные и служебные адреса (127.0.0.1 от DNS-фильтра VPN, 198.18/15 — fake-IP
+# прокси, частные сети) в таблицу не попадают никогда.
+typeset -g HOSTS_PID=0 HOSTS_T=0 HOSTS_MT=''
+
+ip_is_public() {
+  local a=$1 o1 o2
+  if [[ $a == <0-255>.<0-255>.<0-255>.<0-255> ]]; then
+    o1=${a%%.*} o2=${${a#*.}%%.*}
+    (( o1 == 0 || o1 == 10 || o1 == 127 || o1 >= 224 )) && return 1
+    (( (o1 == 169 && o2 == 254) || (o1 == 192 && o2 == 168) )) && return 1
+    (( o1 == 172 && o2 >= 16 && o2 <= 31 )) && return 1
+    (( o1 == 100 && o2 >= 64 && o2 <= 127 )) && return 1
+    (( o1 == 198 && (o2 == 18 || o2 == 19) )) && return 1
+    return 0
+  fi
+  [[ $a != */* ]] && net_is_valid $a || return 1
+  a=${(L)a}
+  [[ $a == (::|::1|fe[89ab]?:*|f[cd]??:*|ff??:*|::ffff:*) ]] && return 1
+  return 0
+}
+
+hosts_sig() { print -r -- "# hosts: ${BLOCK_HOSTS[*]}" }
+
+# фоновая задача: имена → адреса, объединение с кэшем, атомарная запись
+hosts_job() {
+  local h a line sig=$(hosts_sig)
+  local -a fresh=() old=() all=()
+  for h in $BLOCK_HOSTS[@]; do
+    for line in ${(f)"$(${=RESOLVER} $h 2>/dev/null)"}; do
+      [[ $line == (ip_address|ipv6_address):* ]] || continue
+      a=${${line#*:}//[[:space:]]/}
+      ip_is_public $a && fresh+=( $a )
+    done
+  done
+  (( ${#fresh} )) || return 0
+  [[ -r $HOSTS_CACHE && "$(head -1 $HOSTS_CACHE 2>/dev/null)" == $sig ]] &&
+    old=( ${(f)"$(tail -n +2 $HOSTS_CACHE)"} )
+  all=( ${(u)fresh[@]} $old[@] )   # свежие — вперёд, при переполнении вытесняются старые
+  all=( ${(u)all[@]} )
+  (( ${#all} > HOSTS_MAX )) && all=( ${all[1,HOSTS_MAX]} )
+  # ничего нового — файл не трогать: демон перезагружает pf, когда файл меняется
+  (( ${#old} )) && [[ ${(j: :)${(o)all}} == ${(j: :)${(o)old}} ]] && return 0
+  { print -r -- $sig; print -rl -- $all[@] } > $HOSTS_CACHE.tmp &&
+    chmod 644 $HOSTS_CACHE.tmp && mv -f $HOSTS_CACHE.tmp $HOSTS_CACHE
+}
+
+# кэш поменялся — забрать адреса; PF_RELOAD=1 — перезагрузить таблицу pf
+hosts_load() {
+  local mt='' a; local -A h
+  zstat -H h -- $HOSTS_CACHE 2>/dev/null && mt="${h[inode]}:${h[mtime]}:${h[size]}"
+  [[ $mt == $HOSTS_MT ]] && return 0
+  HOSTS_MT=$mt
+  local -a ips=()
+  if [[ -n $mt && "$(head -1 $HOSTS_CACHE 2>/dev/null)" == "$(hosts_sig)" ]]; then
+    for a in ${(f)"$(tail -n +2 $HOSTS_CACHE)"}; do ip_is_public $a && ips+=( $a ); done
+  fi
+  [[ ${(j: :)ips} == ${(j: :)HOST_IPS} ]] && return 0
+  HOST_IPS=( $ips[@] )
+  PF_RELOAD=1
+  log "BLOCK_HOSTS: в таблице pf ${#HOST_IPS} адрес(ов) для ${#BLOCK_HOSTS} имён"
+}
+
+# раз в HOSTS_TTL (или сразу, если $1=1) запустить резолв в фоне; забрать готовое.
+# Резолвим только через туннель: при упавшем VPN DNS-запросы ушли бы с настоящего адреса
+# (правило пользователя — ни одного запроса мимо туннеля). Без туннеля работают кэш и
+# встроенные адреса (HOSTS_SEED).
+hosts_refresh() {
+  local force=${1:-0} d
+  if (( ! ${#BLOCK_HOSTS} )); then
+    (( ${#HOST_IPS} )) && { HOST_IPS=(); PF_RELOAD=1 }
+    return 0
+  fi
+  if ! _is_tun $CUR_IF; then
+    hosts_load
+    return 0
+  fi
+  if (( HOSTS_PID )) && kill -0 $HOSTS_PID 2>/dev/null; then
+    :   # прошлый резолв ещё идёт
+  else
+    HOSTS_PID=0
+    d=$(( EPOCHSECONDS - HOSTS_T ))
+    # пока из DNS ничего годного (fake-IP прокси, нет сети) — пробовать каждые 10 с
+    if (( force || d < 0 || d >= HOSTS_TTL || (! ${#HOST_IPS} && d >= 10) )); then
+      HOSTS_T=$EPOCHSECONDS
+      hosts_job &!
+      HOSTS_PID=$!
+    fi
+  fi
+  hosts_load
+}
+
+# строка JSON — в REPLY, без подоболочки на каждое поле
 json_str() {
   local s=$1
   s=${s//\\/\\\\}; s=${s//\"/\\\"}
-  print -rn -- "\"$s\""
+  REPLY="\"$s\""
 }
 
+# $1 — up | unsure | down
 write_status() {
-  local vpn=$1 a pid st n fz lk sep='' tmp=$STATUS_FILE.tmp
-  {
-    print -rn -- "{\"time\":$EPOCHSECONDS,\"vpn\":$vpn,\"iface\":$(json_str "$(_default_iface)"),"
-    print -rn -- "\"country\":$(json_str "$GEO_LAST_CC"),\"on_down\":$(json_str $ON_DOWN),"
-    print -rn -- "\"geo\":$(geo_rule_on && print true || print false),\"countries\":["
-    local c csep=''
-    for c in $BAD_CC[@]; do print -rn -- "$csep$(json_str $c)"; csep=,; done
-    print -rn -- "],\"apps\":["
-    for a in $APPS[@]; do
-      n=0 fz=0 lk=false
-      for pid in ${(f)"$(app_pids $a)"}; do
-        [[ -n $pid ]] || continue
-        (( n++ ))
-        st=$(ps -o state= -p $pid 2>/dev/null)
-        [[ $st == T* ]] && (( fz++ ))
-      done
-      [[ -e $PERM_DIR/$(state_key $a) ]] && lk=true
-      print -rn -- "$sep{\"path\":$(json_str $a),\"locked\":$lk,\"procs\":$n,\"frozen\":$fz}"
-      sep=,
+  local state=$1 vpn=false ok=false geo=false net=$PF_CUR a l n fz lk c out sep='' csep='' tmp=$STATUS_FILE.tmp
+  [[ $state == up ]] && vpn=true
+  (( PF_OK )) && ok=true
+  geo_rule_on && geo=true
+  # не встало — показать, что пытались: пустое "net" щит понимает как «сеть не настроена»
+  [[ -n $net ]] || net=$PF_WANT
+  (( PS_DIRTY )) && ps_snap
+  json_str $state;        out="{\"time\":$EPOCHSECONDS,\"cycle\":$CYCLE_N,\"state\":$REPLY,\"vpn\":$vpn,"
+  json_str "$CUR_IF";     out+="\"iface\":$REPLY,"
+  json_str "$net";        out+="\"net\":$REPLY,\"net_ok\":$ok,"
+  json_str "$PF_ERR";     out+="\"net_error\":$REPLY,"
+  json_str "$GEO_LAST_CC"; out+="\"country\":$REPLY,"
+  json_str $ON_DOWN;      out+="\"on_down\":$REPLY,\"geo\":$geo,\"countries\":["
+  for c in $BAD_CC[@]; do json_str $c; out+="$csep$REPLY"; csep=,; done
+  out+="],\"apps\":["
+  for a in $APPS[@]; do
+    n=0 fz=0 lk=false
+    app_procs_r $a
+    for l in $reply[@]; do
+      (( n++ ))
+      [[ ${l#* } == T* ]] && (( fz++ ))
     done
-    print -r -- "]}"
-  } > $tmp && chmod 644 $tmp && mv -f $tmp $STATUS_FILE
+    state_key_r $a
+    [[ -e $PERM_DIR/$REPLY ]] && lk=true
+    json_str $a; out+="$sep{\"path\":$REPLY,\"locked\":$lk,\"procs\":$n,\"frozen\":$fz}"
+    sep=,
+  done
+  out+="]}"
+  { print -r -- $out > $tmp && zf_chmod 644 $tmp && zf_mv -f $tmp $STATUS_FILE } 2>/dev/null
   return 0
 }
 
 # снять блокировку с того, чего уже нет в конфиге
 prune_stale_locks() {
   local sf app
+  (( APPS_OK )) || return 0   # список не из конфига/щита — не разблокировать по нему
   for sf in $PERM_DIR/*(.N); do
     app=$(head -1 $sf 2>/dev/null)
     app=${app#\# app: }
     [[ -n $app ]] || continue
-    (( ${APPS[(I)$app]} )) && continue
+    (( ${APPS[(Ie)$app]} )) && continue   # (Ie): путь как есть, а не шаблон — «Foo (Beta).app»
     log "$app убран из конфига — снимаю блокировку"
     unlock_app $app
   done
@@ -572,15 +1034,32 @@ prune_stale_locks() {
 # и сразу пишет, когда VPN падает, поднимается или меняет адрес. awk пропускает только
 # смену маршрутов и адресов: RTM_GET шлёт любой `route get`, в том числе наш же
 # _default_iface — без фильтра демон будил бы сам себя.
-typeset -g NET_FD='' NET_RETRY_T=0 NET_EVENT=0
+typeset -g NET_FD='' NET_RETRY_T=0 NET_EVENT=0 NET_HARD=0 CYCLE_T0=0 CYCLE_N=0
+typeset -g TUN_ID='' TUN_IDX=''   # «паспорт» туннеля, через который пускали: имя|номер|адрес
+
+# паспорт интерфейса — в REPLY (VPN_GUARD_IFACE_FILE.id — для тестов)
+tun_id_r() {
+  local i=$1 out idx='' addr=''
+  if [[ -n ${VPN_GUARD_IFACE_FILE:-} ]]; then
+    REPLY=''; [[ -r $VPN_GUARD_IFACE_FILE.id ]] && REPLY=$(<$VPN_GUARD_IFACE_FILE.id)
+    REPLY=${REPLY//[[:space:]]/}
+    return 0
+  fi
+  out=$(ifconfig -v $i 2>/dev/null)
+  [[ $out == *' index '* ]] && { idx=${out#* index }; idx=${idx%%[^0-9]*} }
+  [[ $out == *'inet '* ]] && { addr=${out#*inet }; addr=${addr%% *} }
+  REPLY="$i|$idx|$addr"
+}
 NET_MONITOR=${VPN_GUARD_NET_MONITOR:-"route -n monitor"}   # подменяется в tests/run.sh
 
 net_watch_start() {
   (( NET_WATCH )) || return 0
   [[ -z $NET_FD ]] || return 0
   (( EPOCHSECONDS >= NET_RETRY_T )) || return 0
+  # IFINFO — с номером интерфейса (if# N): «жёстким» считается только событие туннеля
   exec {NET_FD}< <(${=NET_MONITOR} 2>/dev/null |
-    awk '/^RTM_(ADD|DELETE|CHANGE|NEWADDR|DELADDR|IFINFO)/{print $1; fflush()}')
+    awk '/^RTM_IFINFO/{n=""; if (match($0,/if# [0-9]+/)) n=substr($0,RSTART+4,RLENGTH-4); print "RTM_IFINFO if#" n; fflush(); next}
+         /^RTM_(ADD|DELETE|CHANGE|NEWADDR|DELADDR)/{print $1; fflush()}')
 }
 
 # Монитор живёт в подоболочке (route | awk) и сам не умирает: пока сеть молчит, ему
@@ -596,36 +1075,72 @@ kill_tree() {
 
 net_watch_stop() {
   local c
-  for c in $(pgrep -P $$ 2>/dev/null); do kill_tree $c; done
+  # фоновый резолв BLOCK_HOSTS — тоже ребёнок, его не трогаем
+  for c in $(pgrep -P $$ 2>/dev/null); do (( c == HOSTS_PID )) && continue; kill_tree $c; done
   [[ -n $NET_FD ]] && exec {NET_FD}<&-
   NET_FD=''
   return 0
 }
 
-# Ждёт INTERVAL секунд или первого события сети. Событие: забрать всю пачку (VPN при
-# подключении шлёт их десяток), пометить NET_EVENT — следующий круг заново спросит страну.
+# Ждёт INTERVAL секунд или первого события сети. Событие: сразу закрыть сеть до
+# перепроверки страны (net_event_hold), забрать всю пачку (VPN при подключении шлёт
+# их десяток, но не дольше 0.5 с), пометить NET_EVENT. NET_HARD — в пачке было падение
+# интерфейса/адреса/маршрута (VPN переподключался), а не просто новый адрес IPv6.
 wait_tick() {
-  local line t0=$EPOCHREALTIME
-  NET_EVENT=0
+  local line t0=$EPOCHREALTIME tend wait
+  # ждать остаток INTERVAL от начала круга: иначе запрос страны и проверка pf
+  # растягивали круг (при INTERVAL=1 выходило 1.3 с и больше). Не больше INTERVAL —
+  # если часы перевели назад посреди круга
+  wait=$(( INTERVAL - (EPOCHREALTIME - CYCLE_T0) ))
+  (( wait < 0.05 )) && wait=0.05
+  (( wait > INTERVAL )) && wait=$INTERVAL
+  NET_EVENT=0 NET_HARD=0
   net_watch_start
   if [[ -z $NET_FD ]]; then
-    sleep $INTERVAL
+    sleep $wait
     return 0
   fi
-  if read -t $INTERVAL -u $NET_FD line; then
+  if read -t $wait -u $NET_FD line; then
     NET_EVENT=1
-    local n=0
-    while (( n++ < 200 )) && read -t 0.2 -u $NET_FD line; do :; done
+    net_event_hold
+    [[ -n $TUN_IDX && $line == "RTM_IFINFO if#$TUN_IDX" ]] && NET_HARD=1
+    tend=$(( EPOCHREALTIME + 0.5 ))
+    while (( EPOCHREALTIME < tend )) && read -t 0.1 -u $NET_FD line; do
+      [[ -n $TUN_IDX && $line == "RTM_IFINFO if#$TUN_IDX" ]] && NET_HARD=1
+    done
     return 0
   fi
   # read вернул «нет» раньше срока — поток кончился (монитор упал), а не таймаут
-  if (( EPOCHREALTIME - t0 < INTERVAL - 0.2 )); then
+  if (( EPOCHREALTIME - t0 < wait - 0.2 )); then
     net_watch_stop
     NET_RETRY_T=$(( EPOCHSECONDS + 30 ))
     warn_once "netwatch:$NET_RETRY_T" "монитор сети ($NET_MONITOR) остановился — работаю по таймеру, повтор через 30 с"
-    local left=$(( INTERVAL - (EPOCHREALTIME - t0) ))
+    local left=$(( wait - (EPOCHREALTIME - t0) ))
     (( left > 0 )) && sleep $left
   fi
+  return 0
+}
+
+# страна проверяется на самом деле (правило geo есть и список стран не пуст)
+geo_active() {
+  local r
+  for r in $VPN_CHECK[@]; do
+    case $r in
+      (geo|geo:\!*) (( ${#BAD_CC} )) && return 0 ;;
+      (geo:*)       return 0 ;;
+    esac
+  done
+  return 1
+}
+
+# Событие сети: страну — заново, а пока не ответили — сеть к адресам закрыта (hold).
+# Иначе переподключение на тот же utunN (ядро отдаёт наименьший свободный номер),
+# но к серверу в стране блокировки, пропускало запросы до ответа Cloudflare:
+# pf различает только имя интерфейса.
+net_event_hold() {
+  GEO_LAST_T=0
+  geo_active || return 0
+  [[ $PF_CUR == via:* ]] && pf_apply hold
   return 0
 }
 
@@ -635,49 +1150,99 @@ cmd_daemon() {
   mkdir -p $PERM_DIR
   chmod 755 $STATE_DIR   # status.json должен читаться без sudo; perms/ остаётся 700
   load_conf
-  # остановка демона (launchctl bootout, kill) — убрать за собой монитор сети
-  trap 'net_watch_stop; exit 0' TERM INT HUP
-  local a last=init down_since=0 mt=$(conf_mtime)
-  log "vpn-guard запущен: правила=[${VPN_CHECK[*]}] ($VPN_REQUIRE), при падении VPN=$ON_DOWN, блокировка запуска=$LOCK_LAUNCH, интервал=${INTERVAL}с, страны блокировки: ${BAD_CC[*]:-не заданы}"
-  (( ${#APPS} )) || log "ВНИМАНИЕ: список APPS пуст — сторожить нечего"
+  CUR_IF=$(_default_iface)
+  hosts_load
+  # закрыто, пока не доказано обратное: после перезагрузки якорь пуст, а первая
+  # проверка страны может идти секунды (2026-10-03 — 5 минут без правил)
+  pf_apply hold
+  $PFCTL -a $PF_ANCHOR_OLD -F all >/dev/null 2>&1   # якорь под старым именем (до 2026-10-09)
+  # остановка (launchctl bootout при обновлении, kill): сеть оставить закрытой, монитор
+  # убрать. «Охрана выключена» в Vafa и uninstall после остановки зовут unlock — он снимает pf.
+  trap 'pf_apply hold; write_status stopped; net_watch_stop; exit 0' TERM INT HUP
+  local a last=init state prev_state=init down_since=0 mt
+  conf_mtime; mt=$REPLY
+  log "vpn-guard запущен: правила=[${VPN_CHECK[*]}] ($VPN_REQUIRE), при падении VPN=$ON_DOWN, блокировка запуска=$LOCK_LAUNCH, интервал=${INTERVAL}с, страны блокировки: ${BAD_CC[*]:-не заданы}; сеть к Anthropic закрыта до первой проверки"
+  (( ${#APPS} )) || log "ВНИМАНИЕ: список APPS пуст — сторожится только сеть"
   prune_stale_locks
 
   while :; do
-    if [[ $(conf_mtime) != $mt ]]; then
-      mt=$(conf_mtime)
+    conf_mtime
+    if [[ $REPLY != $mt ]]; then
+      mt=$REPLY
       log "конфиг изменился — перечитываю"
+      local -a old_apps=( $APPS[@] )
       load_conf
       prune_stale_locks
+      # убрали из списка, пока заморожено — иначе так и висело бы в SIGSTOP навсегда
+      if (( APPS_OK )); then
+        ps_snap
+        for a in $old_apps[@]; do (( ${APPS[(Ie)$a]} )) || resume_app $a; done
+      fi
       last=init
-      PF_CUR=''
-      (( ${#BLOCK_NETS} )) || pf_off
+      PF_RELOAD=1
+      HOSTS_MT='' HOSTS_T=0   # BLOCK_HOSTS могли поменяться — перечитать и перерезолвить
       (( NET_WATCH )) || net_watch_stop
     fi
 
-    # сеть поменялась — страну спросить заново, не дожидаясь GEO_TTL (пачку событий
-    # от переподключения VPN wait_tick уже схлопнул в одно)
-    (( NET_EVENT )) && GEO_LAST_T=0
+    CYCLE_T0=$EPOCHREALTIME
+    (( CYCLE_N++ ))
+    default_iface_r; CUR_IF=$REPLY   # один снимок на круг — им пользуются и проверка, и pf
+    # VPN мог переподключиться (тот же utunN, неизвестный сервер): соединения, открытые
+    # через старый туннель, оборвать, пока страна не перепроверена. Только если событие
+    # про сам туннель (IFINFO с его номером) или у туннеля сменился «паспорт» (имя, номер,
+    # адрес) — события чужих интерфейсов (awdl0, мост виртуалки) соединения не трогают
+    if (( NET_EVENT )) && [[ $PF_CUR == hold && -n $TUN_ID ]]; then
+      tun_id_r $CUR_IF
+      [[ $REPLY != $TUN_ID ]] && NET_HARD=1
+      (( NET_HARD )) && pf_kill_states
+    fi
+    # сеть поменялась — имена перерезолвить тем же DNS, каким сейчас пользуются приложения
+    hosts_refresh $NET_EVENT
 
+    # up — VPN есть и страна подтверждена; unsure — маршрут есть, но страна не
+    # подтверждена свежим ответом (или идёт GRACE); down — VPN нет
     if vpn_up; then
-      if [[ $last != up ]]; then
-        log "VPN поднят — снимаю блокировку"
-        [[ $last == down ]] && notify "VPN поднят" "приложения разблокированы"
-        last=up
-      fi
       down_since=0
-      GUARD_DOWN=0
-      TERMED=()
-      for a in $APPS[@]; do
-        unlock_app $a
-        resume_app $a
-      done
-      pf_apply $(pf_mode_when_up)
-      write_status true
+      if (( GEO_UNSURE )); then state=unsure; else state=up; fi
     else
       (( down_since )) || down_since=$EPOCHSECONDS
-      if (( EPOCHSECONDS - down_since >= GRACE )); then
+      # часы перевели назад — не продлевать GRACE на величину прыжка
+      (( EPOCHSECONDS < down_since )) && down_since=$(( EPOCHSECONDS - GRACE ))
+      if (( EPOCHSECONDS - down_since >= GRACE )); then state=down; else state=unsure; fi
+    fi
+
+    # снимок процессов: при блокировке и смене состояния — каждый круг, иначе раз в PS_EVERY с
+    if [[ $state != up || $prev_state != up ]] || (( EPOCHSECONDS - PS_T >= PS_EVERY || EPOCHSECONDS < PS_T )); then
+      ps_snap
+    fi
+
+    case $state in
+      (up)
+        pf_mode_when_up
+        pf_apply $REPLY               # сеть — до разморозки
+        if [[ $last != up ]]; then
+          log "VPN поднят — снимаю блокировку"
+          [[ $last == down ]] && notify "VPN поднят" "приложения разблокированы"
+          last=up
+        fi
+        GUARD_DOWN=0
+        TERMED=()
+        for a in $APPS[@]; do
+          unlock_app $a
+          resume_app $a
+        done
+        ;;
+      (unsure)
+        pf_apply hold                 # приложения не трогаем — ни морозим, ни размораживаем
+        # вошли в «не уверен» — оборвать открытые соединения один раз: через туннель с
+        # неподтверждённым выходом не должно ходить и то, что открыли раньше
+        [[ $prev_state != unsure ]] && (( PF_KILL_CYCLE != CYCLE_N )) && pf_kill_states
+        log_every unsure 60 "страна выхода не подтверждена (маршрут: $CUR_IF, страна: ${GEO_LAST_CC:-?}) — сеть к Anthropic закрыта, приложения не трогаю"
+        ;;
+      (down)
+        pf_apply block                # сеть — первой, до заморозки
         if [[ $last != down ]]; then
-          log "VPN не обнаружен (маршрут: $(_default_iface), страна: ${GEO_LAST_CC:-?}) — блокирую"
+          log "VPN не обнаружен (маршрут: ${CUR_IF:-нет}, страна: ${GEO_LAST_CC:-?}) — блокирую"
           notify "VPN выключен" "приложения заблокированы"
           last=down
         fi
@@ -689,16 +1254,17 @@ cmd_daemon() {
             (kill)   kill_app $a ;;
           esac
         done
-        pf_apply block
-      fi
-      write_status false
-    fi
+        ;;
+    esac
+    write_status $state
+    prev_state=$state
     wait_tick
   done
 }
 
 cmd_check() {
   load_conf >/dev/null 2>&1
+  CUR_IF=$(_default_iface)
   local rule
   for rule in $VPN_CHECK[@]; do
     local note=''
@@ -707,7 +1273,11 @@ cmd_check() {
     print -r -- $note
   done
   if vpn_up; then
-    print -r -- "VPN: ПОДНЯТ (правило $VPN_REQUIRE)"
+    if (( GEO_UNSURE )); then
+      print -r -- "VPN: НЕ УВЕРЕН — страна не подтверждена свежим ответом (правило $VPN_REQUIRE)"
+    else
+      print -r -- "VPN: ПОДНЯТ (правило $VPN_REQUIRE)"
+    fi
     return 0
   else
     print -r -- "VPN: ВЫКЛЮЧЕН (правило $VPN_REQUIRE)"
@@ -717,8 +1287,12 @@ cmd_check() {
 
 cmd_status() {
   load_conf >/dev/null 2>&1
-  print -r -- "default route -> $(_default_iface)"
+  CUR_IF=$(_default_iface)
+  print -r -- "default route -> $CUR_IF"
   cmd_check
+  # IPv6 мимо туннеля pf и так режет; страну по v6 здесь не спрашиваем: такой запрос сам
+  # ушёл бы мимо туннеля — с настоящего адреса. Только есть ли маршрут.
+  print -r -- "  IPv6: $(route -n get -inet6 default 2>/dev/null | awk '/interface: /{print "маршрут по умолчанию через " $2; f=1} END{if(!f) print "маршрута по умолчанию нет"}')"
   print
   print -r -- "Приложения под охраной:"
   (( ${#APPS} )) || print -r -- "  (список пуст)"
@@ -732,13 +1306,20 @@ cmd_status() {
   done
   print
   print -r -- "Сетевой блок (pf, $PF_ANCHOR):"
-  if (( ! ${#BLOCK_NETS} )); then
+  hosts_load >/dev/null 2>&1
+  print -r -- "  адресов: сети ${#BLOCK_NETS}, из имён BLOCK_HOSTS ${#HOST_IPS} (имён ${#BLOCK_HOSTS})"
+  if [[ -r $STATUS_FILE ]]; then
+    local js; js=$(<$STATUS_FILE)
+    print -r -- "  по данным демона: режим ${${js#*\"net\":\"}%%\"*}, $([[ $js == *'"net_ok":true'* ]] && print 'фильтр работает' || print "НЕ РАБОТАЕТ: ${${js#*\"net_error\":\"}%%\"*}")"
+  fi
+  if (( ! ${#BLOCK_NETS} && ! ${#HOST_IPS} )); then
     print -r -- "  не настроен (BLOCK_NETS пуст)"
   elif (( EUID != 0 )); then
-    print -r -- "  (посмотреть можно только через sudo)"
+    print -r -- "  (сами правила pf видно только через sudo)"
   else
+    $PFCTL -s info 2>/dev/null | grep '^Status' | sed 's/^/  pf: /'
     local r
-    r=$(pfctl -a $PF_ANCHOR -s rules 2>/dev/null)
+    r=$($PFCTL -a $PF_ANCHOR -s rules 2>/dev/null)
     if [[ -n $r ]]; then print -r -- $r | sed 's/^/  /'; else print -r -- "  правил нет — сеть открыта"; fi
   fi
   print
@@ -749,6 +1330,8 @@ cmd_lock() {
   need_root
   mkdir -p $PERM_DIR
   load_conf
+  hosts_load
+  pf_apply block   # сеть — первой
   local a
   for a in $APPS[@]; do
     (( LOCK_LAUNCH )) && lock_app $a
@@ -757,13 +1340,20 @@ cmd_lock() {
       (kill)   kill_app $a ;;
     esac
   done
-  pf_apply block
 }
 
-# аварийный выход: вернуть всё как было, даже если конфиг уже изменился
+# аварийный выход: вернуть всё как было, даже если конфиг уже изменился.
+# Демон теперь каждую секунду чинит pf — пока он работает, снятое вернулось бы
+# через секунду. Поэтому сначала остановить демон (как «Охрана выключена» в Vafa).
 cmd_unlock() {
   need_root
   local sf app m p
+  if [[ ${VPN_GUARD_TEST:-} != 1 ]] && launchctl print system/local.vpnguard >/dev/null 2>&1; then
+    launchctl bootout system $PLIST 2>/dev/null
+    launchctl disable system/local.vpnguard 2>/dev/null   # как «Охрана выключена» в Vafa — и после перезагрузки
+    print -r -- "демон остановлен (охрана выключена). Включить снова: Vafa → «Охрана включена»"
+    print -r -- "  или: sudo launchctl enable system/local.vpnguard && sudo launchctl bootstrap system $PLIST"
+  fi
   for sf in $PERM_DIR/*(.N); do
     app=$(head -1 $sf 2>/dev/null); app=${app#\# app: }
     while IFS=$'\t' read -r m p; do
@@ -778,6 +1368,8 @@ cmd_unlock() {
   local a
   for a in $APPS[@]; do resume_app $a >/dev/null; done
   pf_off
+  PF_WANT=''
+  write_status stopped   # чтобы щит не показывал «сеть закрыта» от остановленного демона
   print -r -- "сетевой блок pf снят"
   print -r -- "готово"
 }

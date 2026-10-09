@@ -14,7 +14,9 @@
     <key>KeepAlive</key>
     <true/>
     <key>ProcessType</key>
-    <string>Background</string>
+    <!-- Background урезает процессор: круг шёл раз в 4 с вместо 1 с (замер 2026-10-09).
+         Нагрузка демона с дочерними процессами — ~4 % одного ядра (33 процесса приложения) -->
+    <string>Interactive</string>
     <key>StandardOutPath</key>
     <string>/usr/local/var/log/vpn-guard.log</string>
     <key>StandardErrorPath</key>

@@ -33,6 +33,63 @@ struct GuardStatus: Decodable {
     // nil — старый демон, который о странах ещё не знает
     let countries: [String]?
     let geo: Bool?
+    // nil — старый демон без трёх состояний и без сетевой блокировки
+    let state: String?       // "up" | "unsure" | "down"
+    let net: String?         // "block" | "hold" (закрыто до проверки страны) | "via:utun5" | ""
+    let net_ok: Bool?        // блокировка проверена и стоит на этом такте
+    let net_error: String?
+}
+
+enum Level { case up, unsure, down }
+
+extension GuardStatus {
+    // Новый демон пишет state, старый — только vpn. Незнакомое значение — как «down»:
+    // лучше лишний раз показать красный щит, чем зелёный.
+    var level: Level {
+        switch state {
+        case nil: return vpn ? .up : .down
+        case "up"?: return .up
+        case "unsure"?: return .unsure
+        default: return .down
+        }
+    }
+
+    // Заголовок, когда демон отвечает. «сеть закрыта» не пишем, если сам демон
+    // говорит, что блокировка не стоит.
+    var headline: String {
+        switch level {
+        case .up: return "VPN: поднят"
+        case .unsure: return net_ok == false ? "Проверяю страну выхода"
+                                             : "Проверяю страну выхода — сеть к Anthropic закрыта"
+        case .down: return "VPN: ВЫКЛЮЧЕН — блокировка"
+        }
+    }
+
+    var headlineColor: NSColor {
+        switch level {
+        case .up: return .systemGreen
+        case .unsure: return .systemOrange
+        case .down: return .systemRed
+        }
+    }
+
+    // Строка про сеть к Anthropic; цвет nil — всё в порядке. nil — старый демон, сеть он не закрывает.
+    var netLine: (text: String, color: NSColor?)? {
+        guard let n = net else { return nil }
+        if n == "off" { return ("Сеть к Anthropic: блок выключен в конфиге", .systemOrange) }
+        if net_ok == false {
+            let e = net_error ?? ""
+            // запасной набор: правила не встали, но закрыто всё — «не защищена» тут врало бы
+            if e.hasPrefix("запасной набор") {
+                return ("Сеть к Anthropic: закрыта полностью (\(e))", .systemOrange)
+            }
+            return ("Сеть к Anthropic: НЕ ЗАЩИЩЕНА" + (e.isEmpty ? "" : " — \(e)"), .systemRed)
+        }
+        if n == "block" { return ("Сеть к Anthropic: закрыта", nil) }
+        if n == "hold" { return ("Сеть к Anthropic: закрыта до проверки страны", nil) }
+        if n.hasPrefix("via:") { return ("Сеть к Anthropic: только через \(n.dropFirst(4))", nil) }
+        return ("Сеть к Anthropic: \(n.isEmpty ? "не настроена" : n)", .systemOrange)
+    }
 }
 
 func readStatus() -> GuardStatus? {
@@ -236,11 +293,17 @@ struct StatusView: View {
         VStack(alignment: .leading, spacing: 4) {
             if let s = status {
                 let stale = Date().timeIntervalSince1970 - s.time > 20
-                Text(stale ? "Демон не отвечает" : (s.vpn ? "VPN: поднят" : "VPN: ВЫКЛЮЧЕН — блокировка"))
+                Text(stale ? "Демон не отвечает" : s.headline)
                     .font(.title2.bold())
-                    .foregroundColor(stale ? .orange : (s.vpn ? .green : .red))
+                    .foregroundColor(stale ? .orange : Color(nsColor: s.headlineColor))
+                    .fixedSize(horizontal: false, vertical: true)
                 Text("маршрут: \(s.iface.isEmpty ? "—" : s.iface), страна: \(s.country.isEmpty ? "нет ответа" : s.country)")
                     .foregroundColor(.secondary)
+                // у молчащего демона «сеть закрыта» уже не проверено — не показывать
+                if !stale, let n = s.netLine {
+                    Text(n.text).foregroundColor(n.color.map { Color(nsColor: $0) } ?? .secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
                 ForEach(s.apps, id: \.path) { a in
                     Text("\(appName(a.path)) — запуск: \(a.locked ? "ЗАБЛОКИРОВАНО" : "разблокировано"), процессов: \(a.procs)"
                          + (a.frozen > 0 ? ", заморожено: \(a.frozen)" : ""))
@@ -307,13 +370,26 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let symbol: String, tint: NSColor
         switch last {
         case _ where !on: symbol = "shield"; tint = .systemGreen
-        // охрана выключена (демон не работает) или сторожить нечего — пустой контур
-        case nil: symbol = "shield"; tint = .systemGreen
-        case let s? where isStale(s) || s.apps.isEmpty: symbol = "shield"; tint = .systemGreen
-        case let s? where s.vpn: symbol = "checkmark.shield.fill"; tint = .systemGreen
+        // охрана включена, а status.json нет или он старше 20 с — демон не отвечает,
+        // спокойный контур тут врал бы
+        case nil: symbol = "exclamationmark.shield"; tint = .systemOrange
+        case let s? where isStale(s): symbol = "exclamationmark.shield"; tint = .systemOrange
+        // сторожить нечего: ни приложений, ни сетевой блокировки (она закрывает и CLI,
+        // и браузер, поэтому при пустом списке тоже считается) — пустой контур
+        // фильтр должен стоять, но не стоит — это важнее всего остального (и при «down»:
+        // красный «блокировка» тут врал бы, что сеть закрыта). "off" — блок выключен в конфиге
+        case let s? where s.net_ok == false && s.net != "off" && !(s.net ?? "").isEmpty:
+            symbol = "exclamationmark.shield.fill"; tint = s.level == .down ? .systemRed : .systemOrange
+        case let s? where s.apps.isEmpty && ((s.net ?? "").isEmpty || s.net == "off"):
+            symbol = "shield"; tint = .systemGreen
+        // туннель есть, страна ещё не подтверждена: сеть закрыта, приложения не заморожены
+        case let s? where s.level == .unsure: symbol = "shield.lefthalf.filled"; tint = .systemOrange
+        case let s? where s.level == .up: symbol = "checkmark.shield.fill"; tint = .systemGreen
         default: symbol = "xmark.shield.fill"; tint = .systemRed
         }
-        let img = NSImage(systemSymbolName: symbol, accessibilityDescription: "Vafa")?
+        // без запасного варианта при незнакомом имени символа значок пропал бы из строки меню
+        let img = (NSImage(systemSymbolName: symbol, accessibilityDescription: "Vafa")
+                   ?? NSImage(systemSymbolName: "shield", accessibilityDescription: "Vafa"))?
             .withSymbolConfiguration(.init(paletteColors: [tint]))
         item.button?.image = img
         if menu.numberOfItems > 0 { rebuild() }   // меню открыто — обновить на лету
@@ -332,20 +408,26 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     func rebuild() {
         menu.removeAllItems()
+        let on = guardOn()
         if let s = last {
-            if !guardOn() {
+            if !on {
                 info("Охрана выключена", bold: true, color: .secondaryLabelColor)
+                // демон остановили, а снять сеть не успели (не через Vafa и не unlock)
+                if s.state == "stopped" && s.net == "hold" {
+                    info("Сеть к Anthropic закрыта — снять: sudo vpn-guard unlock", color: .systemOrange)
+                }
             } else if isStale(s) {
                 info("Демон не отвечает", bold: true, color: .systemOrange)
                 info("последнее обновление: \(Int(Date().timeIntervalSince1970 - s.time)) с назад")
             } else {
-                info(s.vpn ? "VPN: поднят" : "VPN: ВЫКЛЮЧЕН — блокировка", bold: true,
-                     color: s.vpn ? .systemGreen : .systemRed)
+                info(s.headline, bold: true, color: s.headlineColor)
             }
             info("маршрут: \(s.iface.isEmpty ? "—" : s.iface), страна: \(s.country.isEmpty ? "нет ответа" : s.country)")
+            // при выключенной охране или молчащем демоне это уже не проверено — не показывать
+            if on && !isStale(s), let n = s.netLine { info(n.text, color: n.color) }
             if let cc = s.countries {
-                let on = s.geo ?? true
-                info(!on ? "проверка страны выключена в конфиге"
+                let geoOn = s.geo ?? true
+                info(!geoOn ? "проверка страны выключена в конфиге"
                      : cc.isEmpty ? "страны блокировки не выбраны"
                      : "блокировать из: " + cc.map { "\(flag($0)) \($0)" }.joined(separator: "  "))
             }
@@ -373,7 +455,6 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
         log.target = self
         menu.addItem(log)
         menu.addItem(.separator())
-        let on = guardOn()
         let g = NSMenuItem(title: "Охрана включена", action: #selector(toggleGuard), keyEquivalent: "")
         g.state = on ? .on : .off
         g.target = self

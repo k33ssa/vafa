@@ -1,0 +1,90 @@
+#!/bin/zsh
+# Подменный pfctl для tests/run_macos.sh: без root, состояние — файлы в $FAKE_PF_DIR.
+# Правила, которые демон грузит в якорь, проверяет НАСТОЯЩИЙ парсер pf (/sbin/pfctl -nvf -
+# работает без root) и хранит в том виде, в каком их показал бы `pfctl -a … -s rules`.
+#   enabled           — есть файл: pf включён
+#   main.rules        — основной набор правил (точка подключения com.apple/*)
+#   anchor.rules      — правила якоря демона ($FAKE_PF_ANCHOR, по умолчанию com.apple/000.vpn-guard)
+#   anchor.table      — содержимое таблицы <vpnguard>
+#   other.<имя>.rules — правила любого другого якоря (например, старого com.apple/vpn-guard)
+#   fail-load         — есть файл: загрузка правил падает (как при битом синтаксисе)
+#   fail-load-pass    — есть файл: падает только загрузка с правилом pass (запасной набор проходит)
+#   drop-table-entry  — есть файл: из таблицы «теряется» последний адрес (проверка сверки таблицы)
+#   calls.log         — журнал вызовов: load-pass / load-block / kill … / enable / …
+emulate -L zsh
+D=${FAKE_PF_DIR:?}
+cd $D || exit 1
+[[ -e main.rules ]] || print -r -- 'anchor "com.apple/*" all' > main.rules
+
+anchor='' show='' file='' flush='' table='' tcmd=''
+typeset -a kills=()
+ME=${FAKE_PF_ANCHOR:-com.apple/000.vpn-guard}
+while (( $# )); do
+  case $1 in
+    (-a) anchor=$2; shift ;;
+    (-s) show=$2; shift ;;
+    (-f) file=$2; shift ;;
+    (-F) flush=$2; shift ;;
+    (-k) kills+=( $2 ); shift ;;
+    (-t) table=$2; shift ;;
+    (-T) tcmd=$2; shift ;;
+    (-E) touch enabled; print -r -- "enable" >> calls.log
+         print -ru2 -- "pf enabled"; print -ru2 -- "Token : $RANDOM"; exit 0 ;;
+    (-X) rm -f enabled; print -r -- "release $2" >> calls.log; shift; exit 0 ;;
+    (-d) rm -f enabled; print -r -- "disable" >> calls.log; exit 0 ;;
+  esac
+  shift
+done
+
+# чужой якорь — свои файлы
+pre=anchor
+[[ -n $anchor && $anchor != $ME ]] && pre="other.${anchor//[^A-Za-z0-9.]/_}"
+
+if (( ${#kills} )); then
+  print -r -- "kill ${kills[*]}" >> calls.log
+  exit 0
+fi
+
+if [[ -n $show ]]; then
+  case $show in
+    (info)  [[ -e enabled ]] && print -r -- "Status: Enabled for 0 days 00:00:01" || print -r -- "Status: Disabled for 0 days 00:00:01" ;;
+    (rules) if [[ -n $anchor ]]; then cat $pre.rules 2>/dev/null; else cat main.rules; fi ;;
+  esac
+  exit 0
+fi
+
+if [[ -n $table && $tcmd == show ]]; then
+  cat $pre.table 2>/dev/null
+  exit 0
+fi
+
+if [[ -n $flush ]]; then
+  if [[ -n $anchor ]]; then rm -f $pre.rules $pre.table; print -r -- "flush-$pre" >> calls.log
+  else : > main.rules; print -r -- "flush-main" >> calls.log; fi
+  exit 0
+fi
+
+if [[ -n $file ]]; then
+  if [[ -z $anchor ]]; then
+    # основной набор: штатный /etc/pf.conf — значит, точка подключения на месте
+    print -r -- 'anchor "com.apple/*" all' > main.rules
+    print -r -- "load-main $file" >> calls.log
+    exit 0
+  fi
+  typeset src out
+  if [[ $file == - ]]; then src=$(cat); else src=$(<$file); fi
+  if [[ -e fail-load ]]; then print -r -- "load-fail" >> calls.log; print -ru2 -- "stdin:1: syntax error"; exit 1; fi
+  if [[ -e fail-load-pass && $src == *$'\n'pass* ]]; then print -r -- "load-fail-pass" >> calls.log; exit 1; fi
+  out=$(print -r -- $src | /sbin/pfctl -nvf - 2>/dev/null) || {
+    print -r -- "load-syntax-error" >> calls.log
+    print -r -- $src > last-bad.rules
+    print -ru2 -- "stdin: syntax error"; exit 1
+  }
+  print -r -- $out | grep -v '^table ' > $pre.rules
+  print -r -- $out | awk '/^table /{sub(/.*\{ */,""); sub(/ *\}.*/,""); gsub(/ +/,"\n"); print}' > $pre.table
+  if [[ -e drop-table-entry ]]; then sed -i '' '$d' $pre.table; fi   # «ядро» потеряло адрес
+  [[ $pre == anchor ]] || { print -r -- "load-$pre" >> calls.log; exit 0; }
+  if grep -q '^pass' anchor.rules; then print -r -- "load-pass" >> calls.log; else print -r -- "load-block" >> calls.log; fi
+  exit 0
+fi
+exit 0

@@ -2,17 +2,8 @@
 
 ## §0. Ждёт пользователя
 
-* [ ] **Поставить обновлённый демон на этот Мак** (нужен sudo, у Claude его нет). Лучше при включённом VPN:
-  ```
-  cd ~/vafa && ./app/build.sh && sudo ./install.sh
-  ```
-  Потом проверить:
-  ```
-  sudo vpn-guard status
-  sudo pfctl -a com.apple/000.vpn-guard -s rules      # при VPN: pass … on utun5 … (if-bound) + block
-  sudo pfctl -a com.apple/000.vpn-guard -t vpnguard -T show | wc -l
-  grep -o '"cycle":[0-9]*' /usr/local/var/vpn-guard/status.json   # растёт ~1 в секунду
-  ```
+* [ ] Посмотреть правила pf глазами (нужен sudo) — при VPN должно быть `pass … on utun5 … (if-bound)` + `block`:
+  `sudo pfctl -a com.apple/000.vpn-guard -s rules`. По `status.json` (без sudo) фильтр стоит: `net_ok:true`.
 * [ ] Решить: выключить телеметрию самого Claude Code — `DISABLE_TELEMETRY=1`,
   `DISABLE_ERROR_REPORTING=1` в `env` файла `~/.claude/settings.json`. Тогда CLI вообще не ходит
   в Datadog/Sentry. Правит пользователь. Цена — нет feature flags, может пропасть Remote Control.
@@ -83,6 +74,13 @@
   битый конфиг не роняет; `unlock` выключает задачу; время в status.json было в местном поясе.
 * [x] Нагрузка: служба 8–15 % → ~4 %, WMI 13–15 % → ~3 % ядра.
 * [x] `tests/run_windows.ps1` — 223/223 в VM (снимок «before-vafa-test-2026-10-09» сохранён).
+
+### 2026-10-10 — установка на этот Мак
+
+* [x] `sudo ./install.sh` (пользователь, 10.10 01:12). Проверено без sudo: `/usr/local/bin/vpn-guard` = репо;
+  `status.json` — `state:up`, `net:via:utun5`, `net_ok:true`, страна FR; 10 кругов за 10 с (было 1 за 4 с);
+  приоритет 31 (был 4); `BLOCK_HOSTS` — 19 адресов через туннель, ни одного 198.18.*; конфиг перенесён,
+  копия старого — `/usr/local/etc/vpn-guard.conf.bak.*`.
 
 ### Раньше
 

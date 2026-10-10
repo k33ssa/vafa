@@ -187,7 +187,7 @@ Check 'VGNative.Now: монотонные секунды (за 1,2 с сна —
 
 Write-Host '== 2a. что считать туннелем, адреса проверки страны, числа в конфиге (функции из vpn-guard.ps1)'
 foreach ($n in $ast.FindAll({ param($x) $x -is [Management.Automation.Language.AssignmentStatementAst] -and "$($x.Left)" -in '$TunnelRx', '$NotTunnelRx', '$NoTime', '$ConfWriters', '$NetCacheTtl', '$TestTunnelIfs' }, $false)) { Invoke-Expression $n.Extent.Text }
-foreach ($n in $ast.FindAll({ param($x) $x -is [Management.Automation.Language.FunctionDefinitionAst] -and $x.Name -in 'Test-Tunnel', 'Read-PbkVpn', 'Get-RasVpnNames', 'Get-GeoIp', 'Get-Num', 'Get-Flag', 'Update-NetCache', 'Test-ConfSafe' }, $true)) { Invoke-Expression $n.Extent.Text }
+foreach ($n in $ast.FindAll({ param($x) $x -is [Management.Automation.Language.FunctionDefinitionAst] -and $x.Name -in 'Test-Tunnel', 'Read-PbkVpn', 'Get-RasVpnNames', 'Get-GeoIp', 'Get-Num', 'Get-Flag', 'Update-NetCache', 'Test-ConfSafe', 'Normalize-Countries' }, $true)) { Invoke-Expression $n.Extent.Text }
 $script:Warns = @()
 function WarnOnce([string]$k, [string]$m) { $script:Warns += $m }
 function Log([string]$m) { }
@@ -236,6 +236,20 @@ Check 'адреса проверки страны по умолчанию — т
 Check "Get-Num: «5m» → по умолчанию (300) с предупреждением, «45» → 45, 10 при минимуме 30 → 300" {
     $script:Warns = @(); (Get-Num '5m' 300 30 300 'hosts_ttl') -eq 300 -and $script:Warns.Count -eq 1 -and (Get-Num '45' 300 30 300 'x') -eq 45 -and (Get-Num 10 300 30 300 'x') -eq 300 -and (Get-Num $null 7 0 0 'x') -eq 7 }
 Check 'Get-Flag: false/«false»/0 → нет, «maybe» → по умолчанию' { -not (Get-Flag $false $true 'f') -and -not (Get-Flag 'false' $true 'f') -and -not (Get-Flag 0 $true 'f') -and (Get-Flag 'maybe' $true 'f') }
+# испорченный block_countries раньше давал пустой список — страна молча не проверялась
+$ccs = [ordered]@{
+    'строка «RU,CN»' = @{ In = 'RU,CN'; Want = 'RU CN' }
+    'строка «ru; by  ir»' = @{ In = 'ru; by  ir'; Want = 'RU BY IR' }
+    '{"value": […], "Count": 2} (установщик d674bf9)' = @{ In = ('{"value":["RU","CN"],"Count":2}' | ConvertFrom-Json); Want = 'RU CN' }
+    'массив ["RU","XX1","by"]' = @{ In = @('RU', 'XX1', 'by'); Want = 'RU BY' }
+    'пустой массив' = @{ In = @(); Want = '' }
+}
+foreach ($k in $ccs.Keys) { $v = $ccs[$k]; Check "Normalize-Countries: $k → «$($v.Want)»" { (@(Normalize-Countries $v.In) -join ' ') -eq $v.Want } }
+# разбор DNS-ответа (проверка fake-IP): запрос + ответ с одной записью A
+$q = [VGNative]::DnsQueryA('dns.quad9.net', 0x1234)
+$r = [byte[]]($q + @(0xC0, 0x0C, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4, 198, 18, 0, 7)); $r[2] = 0x81; $r[3] = 0x80; $r[7] = 1
+Check "DnsQueryA/DnsAnswersA: запрос $($q.Length) байт, ответ → 198.18.0.7" { $q.Length -eq 31 -and $q[0] -eq 0x12 -and (@([VGNative]::DnsAnswersA($r)) -join ',') -eq '198.18.0.7' }
+Check 'DnsAnswersA: мусор и обрезанный ответ — без исключения, пусто' { @([VGNative]::DnsAnswersA([byte[]]@(1, 2, 3))).Count -eq 0 -and @([VGNative]::DnsAnswersA([byte[]]$r[0..35])).Count -eq 0 }
 # Get-NetAdapter упал или пуст — кэш интерфейсов прежний (раньше все становились «RAS — туннель»)
 $script:NetC = @{ T = $NoTime; Ifs = @('old'); Info = @{ 999 = 'old' } }
 function Get-NetAdapter { throw 'WMI не ответил' }
@@ -263,6 +277,33 @@ Copy-Item "$T\FakeApp\fake.exe" "$T\FakeApp\sub\deny.exe"
 & icacls.exe "$T\FakeApp\sub\deny.exe" /grant '*S-1-3-4:(R)' | Out-Null
 & icacls.exe "$T\FakeApp\sub\deny.exe" /deny '*S-1-5-18:(WDAC)' '*S-1-5-32-544:(WDAC)' | Out-Null
 
+Write-Host '== 2c. запрет запуска: запись — до icacls; снятие — со всех exe папки (функции из vpn-guard.ps1)'
+foreach ($n in $ast.FindAll({ param($x) $x -is [Management.Automation.Language.FunctionDefinitionAst] -and $x.Name -in 'Load-State', 'Save-State', 'Lock-App', 'Unlock-App', 'App-Folder', 'Invoke-Native' }, $true)) { Invoke-Expression $n.Extent.Text }
+$StatePath = "$T\locked-test.json"
+New-Item -ItemType Directory -Force "$T\LockT\bin" | Out-Null
+Copy-Item "$T\FakeApp\fake.exe" "$T\LockT\bin\a.exe"; Copy-Item "$T\FakeApp\fake.exe" "$T\LockT\bin\b.exe"
+function Denied([string]$f) { [bool]@((Get-Acl $f).Access | Where-Object { "$($_.AccessControlType)" -eq 'Deny' -and $_.IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value -eq 'S-1-1-0' }).Count }
+Lock-App "$T\LockT\bin"
+Check 'Lock-App: оба exe под запретом, оба в locked.json' { (Denied "$T\LockT\bin\a.exe") -and (Denied "$T\LockT\bin\b.exe") -and @((Load-State)."$T\LockT\bin").Count -eq 2 }
+# прерванный проход: запрет на exe есть, а в записи его нет
+Copy-Item "$T\FakeApp\fake.exe" "$T\LockT\bin\c.exe"; & icacls.exe "$T\LockT\bin\c.exe" /deny '*S-1-1-0:(X)' | Out-Null
+Unlock-App "$T\LockT\bin"
+Check 'Unlock-App: запрет снят со всех трёх (c.exe не был записан)' { -not (Denied "$T\LockT\bin\a.exe") -and -not (Denied "$T\LockT\bin\b.exe") -and -not (Denied "$T\LockT\bin\c.exe") }
+& icacls.exe "$T\LockT\bin\c.exe" /deny '*S-1-1-0:(X)' | Out-Null
+Unlock-App "$T\LockT\bin"
+Check 'Unlock-App без записи — ничего не делает (дёшево в каждом круге up)' { Denied "$T\LockT\bin\c.exe" }
+Unlock-App "$T\LockT\bin" -Sweep
+Check 'Unlock-App -Sweep (unlock) — снимает и без записи' { -not (Denied "$T\LockT\bin\c.exe") }
+New-Item -ItemType Directory -Force "$T\Приложение\bin" | Out-Null; Copy-Item "$T\FakeApp\fake.exe" "$T\Приложение\bin\x.exe"
+Lock-App "$T\Приложение\bin"
+Check 'путь с кириллицей: запись в locked.json (UTF-8 без BOM) читается обратно' { @((Load-State)."$T\Приложение\bin").Count -eq 1 -and (Denied "$T\Приложение\bin\x.exe") }
+Unlock-App "$T\Приложение\bin"
+Check 'путь с кириллицей: запрет снят, записи нет' { -not (Denied "$T\Приложение\bin\x.exe") -and -not (Load-State).PSObject.Properties["$T\Приложение\bin"] }
+Remove-Item "$T\Приложение" -Recurse -Force -ErrorAction SilentlyContinue
+Check 'locked.json пишется без временных файлов-остатков' { -not (Get-ChildItem $T -Filter 'locked-test.json.*.tmp') }
+Remove-Item "$T\LockT", $StatePath -Recurse -Force -ErrorAction SilentlyContinue
+Remove-Variable StatePath
+
 Write-Host '== 2b. права на конфиг: сравниваются SID, а не имена (в русской Windows SYSTEM — «СИСТЕМА»)'
 $cf = "$T\acl-test.json"; Set-Content $cf '{}'
 & icacls.exe $cf /inheritance:r /grant:r '*S-1-5-18:F' '*S-1-5-32-544:F' '*S-1-5-32-545:RX' | Out-Null
@@ -274,9 +315,27 @@ Check '«Прошедшие проверку» могут менять: не г�
 & icacls.exe $cf /remove:g '*S-1-5-11' | Out-Null
 & icacls.exe $cf /grant '*S-1-5-32-545:(WD)' | Out-Null
 Check 'Пользователи могут дописывать (WD): не годится' { -not (Test-ConfSafe $cf) }
-Check 'имена ACE на этой Windows — английские, а проверка от них не зависит (в коде нет имён)' {
-    $names = @((Get-Acl $cf).Access | ForEach-Object { "$($_.IdentityReference)" }); $src = (Get-Command Test-ConfSafe).Definition
-    ($names -match 'SYSTEM') -and $src -notmatch 'SYSTEM\$|Administrators|Администраторы' }
+& icacls.exe $cf /inheritance:r /grant:r '*S-1-5-18:F' '*S-1-5-32-544:F' '*S-1-5-32-545:RX' | Out-Null
+& icacls.exe $cf /setowner '*S-1-5-32-545' | Out-Null
+Check 'владелец файла — Пользователи (права сами по себе безопасные): не годится' { -not (Test-ConfSafe $cf) }
+& icacls.exe $cf /setowner '*S-1-5-32-544' | Out-Null
+Check 'владелец — Администраторы: годится' { Test-ConfSafe $cf }
+$cdir = "$T\acl-dir"; New-Item -ItemType Directory -Force $cdir | Out-Null; $cf2 = "$cdir\config.json"; Set-Content $cf2 '{}'
+& icacls.exe $cdir /inheritance:r /grant:r '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F' '*S-1-5-32-545:(OI)(CI)RX' | Out-Null
+& icacls.exe $cf2 /reset | Out-Null
+Check 'папка: Пользователи — только чтение: годится' { Test-ConfSafe $cf2 }
+& icacls.exe $cdir /grant '*S-1-5-32-545:(WD)' | Out-Null
+& icacls.exe $cf2 /inheritance:r /grant:r '*S-1-5-18:F' '*S-1-5-32-544:F' '*S-1-5-32-545:RX' | Out-Null
+Check 'папка: Пользователи могут создавать файлы (файл сам безопасен): не годится' { -not (Test-ConfSafe $cf2) }
+& icacls.exe $cdir /remove:g '*S-1-5-32-545' | Out-Null; & icacls.exe $cdir /grant '*S-1-5-32-545:(OI)(CI)RX' | Out-Null
+& icacls.exe $cdir /setowner '*S-1-5-32-545' | Out-Null
+Check 'владелец папки — Пользователи: не годится' { -not (Test-ConfSafe $cf2) }
+& icacls.exe $cdir /setowner '*S-1-5-32-544' | Out-Null
+Remove-Item $cdir -Recurse -Force
+$names = @((Get-Acl $cf).Access | ForEach-Object { "$($_.IdentityReference)" })
+Check "имена ACE на этой Windows ($($names -join ', ')) — проверка от них не зависит (в коде нет имён)" {
+    $src = (Get-Command Test-ConfSafe).Definition
+    ($names -match 'SYSTEM|СИСТЕМА') -and $src -notmatch 'SYSTEM\$|Administrators|Администраторы' }
 Remove-Item $cf -Force
 
 $egIdx = (Find-NetRoute -RemoteIPAddress 1.1.1.1 | Where-Object InterfaceIndex | Select-Object -First 1).InterfaceIndex
@@ -289,6 +348,15 @@ $script:GeoJob = Start-Job -ArgumentList $T, $Port -ScriptBlock {
     $l = New-Object Net.HttpListener; $l.Prefixes.Add("http://+:$Port/"); $l.Start()
     while ($true) {
         $c = $l.GetContext()
+        if ($c.Request.Url.AbsolutePath -eq '/dns-query') {
+            # DNS через HTTPS (как https://1.1.1.1/dns-query): адреса dns.quad9.net
+            $qn = $c.Request.QueryString['name']; $qt = $c.Request.QueryString['type']
+            Add-Content "$T\doh.log" "$(Get-Date -Format 'HH:mm:ss.fff') $($c.Request.RemoteEndPoint) $qn $qt $($c.Request.Headers['Accept'])"
+            $ans = if ($qn -ne 'dns.quad9.net') { '' } elseif ($qt -eq 'AAAA') { '{"name":"dns.quad9.net","type":28,"TTL":60,"data":"2620:fe::fe"}' } else { '{"name":"dns.quad9.net","type":1,"TTL":60,"data":"9.9.9.9"},{"name":"dns.quad9.net","type":1,"TTL":60,"data":"149.112.112.112"}' }
+            $b = [Text.Encoding]::ASCII.GetBytes("{`"Status`":0,`"Answer`":[$ans]}")
+            try { $c.Response.ContentType = 'application/dns-json'; $c.Response.OutputStream.Write($b, 0, $b.Length); $c.Response.Close() } catch {}
+            continue
+        }
         $v = try { "$(Get-Content "$T\trace" -Raw)".Trim() } catch { '' }
         if ($v -match '^HANG (\d+)') { Start-Sleep $Matches[1]; $v = '' }          # молчит, потом отвечает без страны
         if ($v -match '^DELAY (\d+) (\w+)') { Start-Sleep $Matches[1]; $v = $Matches[2] }
@@ -297,7 +365,26 @@ $script:GeoJob = Start-Job -ArgumentList $T, $Port -ScriptBlock {
         try { $c.Response.OutputStream.Write($b, 0, $b.Length); $c.Response.Close() } catch {}
     }
 }
+# обычный DNS (UDP) на адресе виртуалки — для проверки fake-IP: отвечает адресом из файла fakedns
+$DnsPort = Get-Random -Minimum 40001 -Maximum 50000
+Set-Content "$T\fakedns" '9.9.9.9' -Encoding ASCII -NoNewline
+$script:DnsJob = Start-Job -ArgumentList $T, $EgIp, $DnsPort -ScriptBlock {
+    param($T, $EgIp, $DnsPort)
+    $u = New-Object Net.Sockets.UdpClient -ArgumentList (New-Object Net.IPEndPoint -ArgumentList ([Net.IPAddress]::Parse($EgIp)), $DnsPort)
+    while ($true) {
+        $from = New-Object Net.IPEndPoint -ArgumentList ([Net.IPAddress]::Any), 0
+        $q = $u.Receive([ref]$from)
+        $ip = try { "$(Get-Content "$T\fakedns" -Raw)".Trim() } catch { '9.9.9.9' }
+        Add-Content "$T\dnsudp.log" "$(Get-Date -Format 'HH:mm:ss.fff') $from $ip"
+        $r = [byte[]]($q + @(0xC0, 0x0C, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4) + [byte[]]@($ip -split '\.' | ForEach-Object { [byte]$_ }))
+        $r[2] = 0x81; $r[3] = 0x80; $r[7] = 1
+        [void]$u.Send($r, $r.Length, $from)
+    }
+}
+Clear-DnsClientCache
 $env:VPN_GUARD_ROOT = $T
+$env:VPN_GUARD_DOH_URL = "http://${EgIp}:$Port/dns-query"
+$env:VPN_GUARD_DNS_PORT = "$DnsPort"
 $env:VPN_GUARD_GEO_URLS = "http://${EgIp}:$Port/trace"
 $script:BaseConf = @{
     apps = @("$T\FakeApp"); checks = @('geo'); block_countries = @('RU'); require = 'all'; on_down = 'freeze'; lock_launch = $true
@@ -306,7 +393,7 @@ $script:BaseConf = @{
     interval = 1; geo_ttl = 1; geo_ttl_down = 1; geo_stale = 8; grace = 0; net_watch = $true
 }
 Conf
-$loopId = $null; $loopAlias = $null; $addedIp = $false; $route4 = $null; $route6 = $null; $clock = $null
+$loopId = $null; $loopAlias = $null; $addedIp = $false; $route4 = $null; $route6 = $null; $route1 = $null; $clock = $null
 $env:VPN_GUARD_TUNNEL_IFS = $egress
 $profOrig = (Get-NetFirewallProfile -Profile Public -PolicyStore PersistentStore).Enabled
 $disOrig = @((Get-NetFirewallProfile -Profile Public -PolicyStore PersistentStore).DisabledInterfaceAliases)
@@ -396,6 +483,15 @@ try {
             Check "IPv4 мимо туннеля: down за $w с" { $w }
             Check 'журнал: «160.79.104.10 (Anthropic) идёт мимо туннеля … VPN не засчитан»' { ((LogLines) -join "`n") -match '160\.79\.104\.10 \(Anthropic\) идёт мимо туннеля.*VPN не засчитан' }
             Remove-NetRoute -DestinationPrefix '160.79.104.10/32' -InterfaceIndex $li -PolicyStore ActiveStore -Confirm:$false; $route4 = $null
+            # выход (1.1.1.1) не через туннель при checks=route,geo: route — «нет» первым, до geo
+            # дело не доходит, но страна туннеля всё равно забывается (было: «интерфейс: Ethernet,
+            # страна: FR» в статусе и щите — замер с sing-box)
+            $w = WaitFor { $s = St; $s.state -eq 'up' -and $s.country -eq 'DE' } 15
+            New-NetRoute -DestinationPrefix '1.1.1.1/32' -InterfaceIndex $li -NextHop '0.0.0.0' -PolicyStore ActiveStore | Out-Null; $route1 = $li
+            $w2 = WaitFor { $s = St; $s.state -eq 'down' -and $s.iface -eq $loopAlias } 8
+            $s = St
+            Check "checks=route,geo, выход через $loopAlias (не туннель): down, страны туннеля в статусе нет (country='$($s.country)'; $w / $w2 с)" { $w -and $w2 -and $s.country -eq '' }
+            Remove-NetRoute -DestinationPrefix '1.1.1.1/32' -InterfaceIndex $li -PolicyStore ActiveStore -Confirm:$false; $route1 = $null
             Conf
             $w = WaitFor { (St).state -eq 'up' -and -not (Frozen) } 15
             Check "маршрут убран, checks=geo — снова up, приложение разморожено ($w с)" { $w }
@@ -471,6 +567,27 @@ try {
     $ifz = -1; for ($i = [Math]::Max(0, $iv); $i -lt $L.Count; $i++) { if ($L[$i] -match 'заморожен процесс') { $ifz = $i; break } }
     $ic = -1; for ($i = $ifz; $i -ge 0; $i--) { if ($L[$i] -match 'сеть к Anthropic: ЗАКРЫТА') { $ic = $i; break }; if ($L[$i] -match 'только через') { break } }
     Check "порядок в журнале: сеть закрыта (стр. $ic) раньше заморозки (стр. $ifz)" { $ic -ge 0 -and $ifz -gt $ic }
+
+    Check 'block_hosts: резолв через DoH по туннелю (doh.log: A и AAAA, accept: application/dns-json), системный DNS не спрошен' {
+        $d = @(Get-Content "$T\doh.log" -ErrorAction SilentlyContinue)
+        ($d -match 'dns\.quad9\.net A application/dns-json').Count -and ($d -match 'dns\.quad9\.net AAAA').Count -and -not (Get-DnsClientCache -Entry 'dns.quad9.net' -ErrorAction SilentlyContinue) }
+
+    Write-Host '== 5a. VPN-клиент с fake-IP (DNS через туннель отвечает 198.18.x.x): в down закрыта и 198.18.0.0/15, в up — нет'
+    Set-Content "$T\fakedns" '198.18.0.7' -Encoding ASCII -NoNewline
+    Conf                                       # перечитать конфиг — резолв заново
+    $w = WaitFor { (RuleAddrs) -contains '198.18.0.0/255.254.0.0' } 15
+    Check "fake-IP замечен: 198.18.0.0/15 в правиле за $w с (запросов к DNS: $(@(Get-Content "$T\dnsudp.log" -ErrorAction SilentlyContinue).Count))" { $w }
+    Check 'журнал: «подменяет адреса DNS (fake-IP»' { ((LogLines) -join "`n") -match 'подменяет адреса DNS \(fake-IP' }
+    Geo 'DE'
+    $w = WaitFor { (St).state -eq 'up' -and -not ((RuleAddrs) -contains '198.18.0.0/255.254.0.0') -and (RuleAddrs) -match '^9\.9\.9\.9' } 15
+    Check "up: в правиле «только через» 198.18.0.0/15 нет ($w с)" { $w }
+    Set-Content "$T\fakedns" '9.9.9.9' -Encoding ASCII -NoNewline
+    Conf
+    $w = WaitFor { ((LogLines) -join "`n") -match 'больше не подменяет' } 15
+    Geo 'RU'
+    $w2 = WaitFor { (St).state -eq 'down' -and (RuleAddrs) -match '^9\.9\.9\.9' -and -not ((RuleAddrs) -contains '198.18.0.0/255.254.0.0') } 15
+    Check "fake-IP пропал: в down 198.18.0.0/15 уже не закрыт ($w / $w2 с)" { $w -and $w2 }
+    [void](WaitFor { Frozen } 10)
 
     Write-Host '== 6. самопочинка правила'
     Remove-NetFirewallRule -DisplayName 'VPNGuard-Block' -ErrorAction SilentlyContinue
@@ -560,6 +677,10 @@ try {
     Check "снова up за $w с" { $w }
 
     Write-Host '== 10a. status.json держит читатель — запись не удалась, но сеть из-за этого не закрывается'
+    # «Cloudflare» теста однопоточный: после HANG 8 из раздела 10 он ещё отвечает с задержкой, и
+    # демон мог уйти в unsure/down посреди проверки (так было в прогоне на русской Windows)
+    Start-Sleep 8
+    [void](WaitFor { (St).state -eq 'up' } 15)
     $n0 = @((LogLines) -match 'сеть к Anthropic: ЗАКРЫТА').Count; $net0 = (St).net
     # без FILE_SHARE_DELETE (как Get-Content) — Replace у демона не проходит
     $fs = [IO.File]::Open("$T\status.json", [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite)
@@ -601,6 +722,15 @@ try {
     $w = WaitFor { (St).state -eq 'up' } 15
     Check "снова up ($w с)" { $w }
 
+    Write-Host '== 11b. перерыв между кругами дольше geo_stale (как сон VM): «не уверен», а не сразу down'
+    [void](WaitFor { (St).state -eq 'up' } 15)
+    [void][VGNative]::Suspend($script:D.Id); Start-Sleep 12; [void][VGNative]::Resume($script:D.Id)
+    $seen = @(); $sw = [Diagnostics.Stopwatch]::StartNew()
+    while ($sw.Elapsed.TotalSeconds -lt 6) { $s = St; if ($s) { $seen += $s.state }; Start-Sleep -Milliseconds 100 }
+    Check "после паузы 12 с (geo_stale=8): $(@($seen | Select-Object -Unique) -join ' → '), down не было, снова up" { $seen -notcontains 'down' -and $seen[-1] -eq 'up' -and $seen -contains 'unsure' }
+    Check 'журнал: «перерыв … между кругами»' { ((LogLines) -join "`n") -match 'перерыв \d+ с между кругами' }
+    Check 'приложение не заморожено' { -not (Frozen) }
+
     Write-Host '== 12. пустые block_nets и block_hosts'
     Geo 'RU'
     [void](WaitFor { (St).state -eq 'down' } 10)
@@ -632,6 +762,16 @@ try {
     Check 'в правиле — адрес dns.quad9.net из кэша (149.112.112.112)' { (RuleAddrs) -match '^149\.112\.112\.112' }
     $out = (& powershell.exe -NoProfile -ExecutionPolicy Bypass -File $Guard check 2>&1) -join "`n"
     Check 'vpn-guard.ps1 check: geo — «нет», без запроса' { $out -match '\[ нет\] geo' -and $out -match 'не спрашиваю — выход не через туннель' -and $out -match 'VPN: ВЫКЛЮЧЕН' -and (GeoCount) -eq $n0 }
+
+    Write-Host '== 12b. VPN засчитан не туннелем (checks=proc:) — «только через» Ethernet не ставится, сеть закрыта везде'
+    Stop-Daemon
+    Conf @{ checks = @('proc:fake') }
+    Start-Daemon
+    $w = WaitFor { $s = St; $s.state -eq 'up' -and $s.net -eq 'block' } 15
+    Check "state=up, net=block ($w с)" { $w }
+    Check 'правило без привязки к интерфейсам, 9.9.9.9 закрыт' { $i = RuleIfs; @(Rules).Count -ge 1 -and (-not $i -or $i -contains 'Any') -and -not (Reach '9.9.9.9') }
+    Check 'журнал: «не туннель: сеть к Anthropic закрыта везде»' { ((LogLines) -join "`n") -match 'не туннель: сеть к Anthropic закрыта везде' }
+    Conf
     $env:VPN_GUARD_TUNNEL_IFS = $egress
     Geo 'RU'
 
@@ -685,8 +825,9 @@ try {
     Set-NetFirewallProfile -Profile Public -Enabled $profOrig -DisabledInterfaceAliases $disOrig
     if ($clock) { Set-Date -Date ($clock.Utc + $clock.Sw.Elapsed).ToLocalTime() | Out-Null }
     Get-Process -Id $script:Fake.Id -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
-    Stop-Job $script:GeoJob -ErrorAction SilentlyContinue; Remove-Job $script:GeoJob -Force -ErrorAction SilentlyContinue
-    Remove-Item Env:VPN_GUARD_ROOT, Env:VPN_GUARD_GEO_URLS, Env:VPN_GUARD_TUNNEL_IFS -ErrorAction SilentlyContinue
+    Stop-Job $script:GeoJob, $script:DnsJob -ErrorAction SilentlyContinue; Remove-Job $script:GeoJob, $script:DnsJob -Force -ErrorAction SilentlyContinue
+    if ($route1) { Remove-NetRoute -DestinationPrefix '1.1.1.1/32' -InterfaceIndex $route1 -PolicyStore ActiveStore -Confirm:$false -ErrorAction SilentlyContinue }
+    Remove-Item Env:VPN_GUARD_ROOT, Env:VPN_GUARD_GEO_URLS, Env:VPN_GUARD_TUNNEL_IFS, Env:VPN_GUARD_DOH_URL, Env:VPN_GUARD_DNS_PORT -ErrorAction SilentlyContinue
     if ($script:Fail -eq 0) { Remove-Item $T -Recurse -Force -ErrorAction SilentlyContinue } else { Write-Host "      файлы теста оставлены: $T" }
 }
 

@@ -87,7 +87,7 @@ function Reset-Warn([string]$prefix) {
     foreach ($k in @($script:Warned.Keys)) { if ($k.StartsWith($prefix)) { $script:Warned.Remove($k) } }
 }
 
-Add-Type -TypeDefinition @'
+try { Add-Type -TypeDefinition @'
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
@@ -201,8 +201,70 @@ public static class VGNative {
             return null;
         } finally { CloseHandle(h); }
     }
+
+    // Запросы к 1.1.1.1 (страна, DNS через HTTPS) — с адреса туннеля: такой пакет Windows
+    // (модель strong host) отправит только через туннель. Туннель пропал между проверкой
+    // маршрута и SYN — запрос не уйдёт вовсе, а не уйдёт с настоящего адреса. Адреса нет или
+    // привязка не удалась — исключение (запрос не идёт), а не null (null — «как обычно»).
+    public static IPAddress BindAddr;
+    public static IPEndPoint BindEP(ServicePoint sp, IPEndPoint remote, int retry) {
+        IPAddress a = BindAddr;
+        if (a == null || retry > 0) throw new InvalidOperationException("tunnel address unavailable");
+        return new IPEndPoint(a, 0);
+    }
+    public static void BindTo(string url) { ServicePointManager.FindServicePoint(new Uri(url)).BindIPEndPointDelegate = new BindIPEndPoint(BindEP); }
+    // первый IPv4-адрес интерфейса с этим индексом; null — нет
+    public static string IfAddr4(int index) {
+        foreach (NetworkInterface n in NetworkInterface.GetAllNetworkInterfaces()) {
+            try {
+                IPInterfaceProperties ip = n.GetIPProperties();
+                IPv4InterfaceProperties p = ip.GetIPv4Properties();
+                if (p == null || p.Index != index) continue;
+                foreach (UnicastIPAddressInformation u in ip.UnicastAddresses)
+                    if (u.Address.AddressFamily == AddressFamily.InterNetwork) return u.Address.ToString();
+            } catch { }
+        }
+        return null;
+    }
+
+    // DNS-запрос A (UDP) и разбор ответа — для проверки, не подменяет ли VPN-клиент адреса
+    // (fake-IP: mihomo/Clash/Hiddify/sing-box отвечают адресами из 198.18.0.0/15)
+    public static byte[] DnsQueryA(string name, int id) {
+        List<byte> b = new List<byte>(new byte[] { (byte)(id >> 8), (byte)id, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0 });
+        foreach (string l in name.TrimEnd('.').Split('.')) { byte[] s = Encoding.ASCII.GetBytes(l); b.Add((byte)s.Length); b.AddRange(s); }
+        b.AddRange(new byte[] { 0, 0, 1, 0, 1 });
+        return b.ToArray();
+    }
+    static int SkipName(byte[] r, int i) {
+        while (i < r.Length) {
+            int n = r[i];
+            if (n == 0) return i + 1;
+            if ((n & 0xC0) == 0xC0) return i + 2;
+            i += n + 1;
+        }
+        return r.Length;
+    }
+    public static string[] DnsAnswersA(byte[] r) {
+        List<string> res = new List<string>();
+        if (r == null || r.Length < 12) return res.ToArray();
+        int qd = (r[4] << 8) | r[5], an = (r[6] << 8) | r[7], i = 12;
+        for (int k = 0; k < qd; k++) i = SkipName(r, i) + 4;
+        for (int k = 0; k < an && i + 10 <= r.Length; k++) {
+            i = SkipName(r, i);
+            if (i + 10 > r.Length) break;
+            int type = (r[i] << 8) | r[i + 1], len = (r[i + 8] << 8) | r[i + 9];
+            i += 10;
+            if (i + len > r.Length) break;
+            if (type == 1 && len == 4) res.Add(r[i] + "." + r[i + 1] + "." + r[i + 2] + "." + r[i + 3]);
+            i += len;
+        }
+        return res.ToArray();
+    }
 }
-'@ -ErrorAction SilentlyContinue
+'@ -ErrorAction Stop } catch {
+    # без VGNative служба работать не может: причину — в журнал (раньше молча падала снова и снова)
+    if (-not ('VGNative' -as [type])) { Log "не компилируется встроенный код C# — служба не запустится: $($_.Exception.Message)"; throw }
+}
 $NoTime = -1e15        # «никогда» для меток [VGNative]::Now()
 
 # Внешняя программа (icacls и т.п.) без исключений: при $ErrorActionPreference = 'Stop' её
@@ -292,8 +354,16 @@ $HostsSeed = @{
     'logs.browser-intake-us5-datadoghq.com' = @('34.149.66.163')
 }
 
+# Принимает и испорченное: строку «RU,CN» (или через ; и пробелы) и {"value": [...], "Count": N} —
+# так PowerShell 5.1 записывал массив установщиком d674bf9. Раньше такое давало пустой список,
+# и страна молча не проверялась.
 function Normalize-Countries($list) {
-    @(@($list) | ForEach-Object { "$_".Trim().ToUpper() } | Where-Object { $_ -match '^[A-Z]{2}$' } | Select-Object -Unique)
+    $flat = foreach ($x in @($list)) {
+        if ($null -eq $x) { continue }
+        if ($x -isnot [string] -and $x.PSObject.Properties['value']) { $x = $x.value }
+        foreach ($y in @($x)) { "$y" -split '[,;\s]+' }
+    }
+    @(@($flat) | ForEach-Object { "$_".Trim().ToUpper() } | Where-Object { $_ -match '^[A-Z]{2}$' } | Select-Object -Unique)
 }
 
 function Default-Conf {
@@ -340,17 +410,28 @@ $ConfWriters = @('S-1-5-18',            # SYSTEM
                  'S-1-5-32-544',        # Администраторы
                  'S-1-3-0',             # CREATOR OWNER
                  'S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464')   # TrustedInstaller
+# Проверяются и владелец (он может переписать права в любой момент — так было, если папку
+# заранее создал обычный пользователь), и права папки: кто может создавать и удалять в ней
+# файлы, тот подменит config.json целиком.
 function Test-ConfSafe([string]$f) {
     if (-not (Test-Path $f)) { return $false }
-    $rules = (Get-Acl $f).GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier])
-    $bad = @($rules | Where-Object {
-        "$($_.AccessControlType)" -eq 'Allow' -and
-        # только биты записи: WriteData, AppendData, WriteEA, WriteAttributes, Delete,
-        # ChangePermissions, TakeOwnership (у Modify/FullControl они есть, у ReadAndExecute — нет)
-        ([int]$_.FileSystemRights -band 0xD0116) -and
-        $ConfWriters -notcontains $_.IdentityReference.Value
-    })
-    return (-not $bad.Count)
+    foreach ($p in @($f, (Split-Path $f -Parent))) {
+        $acl = Get-Acl $p
+        if ($ConfWriters -notcontains $acl.GetOwner([Security.Principal.SecurityIdentifier]).Value) { return $false }
+        # только биты записи: WriteData (у папки — создание файлов), AppendData (создание папок),
+        # WriteEA, WriteAttributes, Delete, ChangePermissions, TakeOwnership, GENERIC_WRITE,
+        # GENERIC_ALL, у папки ещё DeleteChild (у Modify/FullControl они есть, у ReadAndExecute — нет)
+        $mask = if ($p -eq $f) { 0x500D0116 } else { 0x500D0156 }
+        $bad = @($acl.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier]) | Where-Object {
+            "$($_.AccessControlType)" -eq 'Allow' -and
+            # «только для вложенных» (наследуемое) к самой папке не относится
+            -not ("$($_.PropagationFlags)" -match 'InheritOnly') -and
+            ([int]$_.FileSystemRights -band $mask) -and
+            $ConfWriters -notcontains $_.IdentityReference.Value
+        })
+        if ($bad.Count) { return $false }
+    }
+    return $true
 }
 
 # Числа и флаги из конфига: не число («5m», «off») — значение по умолчанию с предупреждением,
@@ -394,8 +475,14 @@ function Load-Conf {
         $legacy = @($c.checks) | Where-Object { "$_" -like 'geo:!*' } | Select-Object -First 1
         if ($legacy) { $c.block_countries = @("$legacy".Substring(5) -split ',') }
     }
+    $rawCc = @(@($c.block_countries) | Where-Object { $null -ne $_ -and "$_".Trim() })
     $c.block_countries = Normalize-Countries $c.block_countries
-    $c.interval     = Get-Num $c.interval 1 1 1 'interval'
+    # список был, но ни одной годной страны — не «не проверять», а по умолчанию ([] — не проверять)
+    if ($rawCc.Count -and -not @($c.block_countries).Count) {
+        WarnOnce "conf:cc:$($rawCc -join ',')" "block_countries: «$($rawCc -join ', ')» — ни одной страны (нужны коды вида RU), беру по умолчанию: $($DefaultCountries -join ' ')"
+        $c.block_countries = $DefaultCountries
+    }
+    $c.interval    = Get-Num $c.interval 1 1 1 'interval'
     $c.geo_ttl      = Get-Num $c.geo_ttl 1 1 1 'geo_ttl'
     $c.geo_ttl_down = Get-Num $c.geo_ttl_down 1 1 1 'geo_ttl_down'
     $c.geo_stale    = Get-Num $c.geo_stale 60 0 60 'geo_stale'
@@ -588,6 +675,8 @@ $script:Geo = @{
     EventT = $script:StartT; LastIf = $null; Sync = $false
 }
 $script:GuardDown = $false
+$script:ResumeT = $NoTime     # круг после перерыва дольше $GapSec с (сон, гибернация)
+$GapSec = 10
 
 # IPv4 из URL проверки страны; $null — в URL имя или IPv6
 function Get-GeoIp([string]$url) {
@@ -609,15 +698,30 @@ function Test-GeoPath([int]$idx, $e) {
     }
     return $true
 }
+# Запрос к $url — с адреса туннеля $e (VGNative.BindEP): Windows отправит его только через
+# туннель, даже если маршрут успел смениться после проверки. $false — у туннеля нет IPv4.
+function Set-TunnelBind([string]$url, $e) {
+    $a = if ($e) { [VGNative]::IfAddr4([int]$e.Index) } else { $null }
+    if (-not $a) { WarnOnce "bind:$($e.Alias)" "у туннеля $($e.Alias) нет IPv4-адреса — к $url не обращаюсь"; return $false }
+    [VGNative]::BindAddr = [Net.IPAddress]::Parse($a)
+    [VGNative]::BindTo($url)
+    return $true
+}
+# HttpClient без системного прокси (он увёл бы запрос мимо туннеля) и без переадресаций
+function New-DirectClient([int]$sec) {
+    $h = New-Object Net.Http.HttpClientHandler
+    $h.UseProxy = $false; $h.AllowAutoRedirect = $false
+    $c = New-Object Net.Http.HttpClient -ArgumentList $h
+    $c.Timeout = [TimeSpan]::FromSeconds($sec)
+    return $c
+}
 # Запрос к первому годному адресу, начиная с $idx; $null — годных нет (это «нет ответа»).
 # Без системного прокси (он увёл бы запрос мимо туннеля) и без переадресаций.
 function New-GeoRequest([int]$idx, $e) {
     for (; $idx -lt $GeoUrls.Count; $idx++) {
         if (-not (Test-GeoPath $idx $e)) { continue }
-        $h = New-Object Net.Http.HttpClientHandler
-        $h.UseProxy = $false; $h.AllowAutoRedirect = $false
-        $c = New-Object Net.Http.HttpClient -ArgumentList $h
-        $c.Timeout = [TimeSpan]::FromSeconds($GeoTimeout)
+        if (-not (Set-TunnelBind $GeoUrls[$idx] $e)) { continue }
+        $c = New-DirectClient $GeoTimeout
         $c.DefaultRequestHeaders.ConnectionClose = $true
         return @{ Client = $c; Task = $c.GetStringAsync($GeoUrls[$idx]); Idx = $idx; If = "$($e.Index)"; Start = [VGNative]::Now() }
     }
@@ -689,14 +793,15 @@ function Sync-Geo($e) {
 function Stop-Geo($e) {
     $G = $script:Geo
     if ($G.Req) { [void](Read-GeoReply $G.Req); $G.Req = $null }
-    $G.LastRoundT = $NoTime; $G.LastIf = ''; $G.LastOk = $false
+    # GoodIf тоже забыть: туннель вернётся с тем же индексом — до свежего ответа страны нет
+    $G.LastRoundT = $NoTime; $G.LastIf = ''; $G.LastOk = $false; $G.GoodIf = ''
     $k = if ($e) { "$($e.Alias)" } else { '' }
     WarnOnce "nogeo:$k" "выход $(if ($e) { "через $($e.Alias)" } else { 'не найден' }) — не туннель: страну не спрашиваю (запрос ушёл бы с настоящего адреса), VPN не засчитан"
 }
 # страна для журнала и статуса: только ответ, полученный через нынешний выход
 function Geo-Shown {
     $G = $script:Geo
-    if ($G.GoodCC -and $G.GoodIf -eq $G.LastIf) { return $G.GoodCC }
+    if ($G.GoodCC -and $G.GoodIf -and $G.GoodIf -eq $G.LastIf) { return $G.GoodCC }
     return ''
 }
 
@@ -712,7 +817,9 @@ function Get-GeoVerdict($conf, [string[]]$list, [bool]$allow) {
     $age = $now - $G.GoodT
     $fresh = $G.LastOk -and $G.GoodT -gt $G.EventT -and $G.GoodIf -eq $G.LastIf -and $age -ge 0 -and $age -le $ttl + $GeoTimeout + 2
     if ($fresh -and $good) { return $true }
-    $ref = if ($G.GoodT -gt $script:StartT) { $G.GoodT } else { $script:StartT }
+    # отсчёт geo_stale — от последнего ответа, старта или пробуждения после сна (ResumeT): иначе
+    # после сна дольше geo_stale сразу down и заморозка, хотя свежий ответ придёт через секунду
+    $ref = [Math]::Max([Math]::Max($G.GoodT, $script:StartT), $script:ResumeT)
     $since = $now - $ref
     if ($since -ge 0 -and $since -lt $conf.geo_stale) { return $null }
     return $false
@@ -808,8 +915,14 @@ function Kill-App([string]$app, $all) {
 }
 
 # ---- запрет запуска ---------------------------------------------------------
-function Load-State { if (Test-Path $StatePath) { try { return (Get-Content $StatePath -Raw | ConvertFrom-Json) } catch {} }; [pscustomobject]@{} }
-function Save-State($s) { $s | ConvertTo-Json -Depth 4 | Set-Content $StatePath -Encoding UTF8 }
+# -Encoding UTF8: Save-State пишет UTF-8 без BOM — иначе PowerShell 5.1 прочёл бы пути с кириллицей как ANSI
+function Load-State { if (Test-Path $StatePath) { try { return (Get-Content $StatePath -Raw -Encoding UTF8 | ConvertFrom-Json) } catch {} }; [pscustomobject]@{} }
+# через временный файл: оборванная запись не должна потерять список заблокированных exe
+function Save-State($s) {
+    $tmp = "$StatePath.$PID.tmp"
+    [IO.File]::WriteAllText($tmp, ($s | ConvertTo-Json -Depth 4), (New-Object Text.UTF8Encoding $false))
+    if (Test-Path $StatePath) { [IO.File]::Replace($tmp, $StatePath, [NullString]::Value) } else { [IO.File]::Move($tmp, $StatePath) }
+}
 
 function Lock-App([string]$app) {
     $dir = App-Folder $app
@@ -819,32 +932,54 @@ function Lock-App([string]$app) {
     $exes = @(Get-ChildItem -Path $dir -Filter *.exe -Recurse -Depth 2 -File -ErrorAction SilentlyContinue | ForEach-Object FullName)
     $new = @($exes | Where-Object { $done -notcontains $_ })
     if (-not $new) { return }
+    # сначала записать, потом icacls: демона убьют посреди прохода — Unlock-App всё равно снимет
+    # запрет (раньше запись шла после, и запрет на часть exe мог остаться навсегда)
+    $st | Add-Member -NotePropertyName $app -NotePropertyValue @($done + $new) -Force
+    Save-State $st
     foreach ($f in $new) {
         $rc = Invoke-Native 'icacls.exe' @($f, '/deny', '*S-1-1-0:(X)')
         if ($rc -eq 0) { $done += $f } else { WarnOnce "acl:$f" "не смог запретить запуск $f (icacls: код $rc)" }
     }
+    # не получившиеся — из записи вон: следующий проход попробует снова
     $st | Add-Member -NotePropertyName $app -NotePropertyValue $done -Force
     Save-State $st
     Log "заблокирован запуск: $app ($($done.Count) exe)"
 }
 
-function Unlock-App([string]$app) {
+# Снимает запрет «Все: выполнение» с записанных exe и со всех exe папки (те, что появились
+# после записи или остались от прерванного прохода). -Sweep — даже без записи (unlock).
+function Unlock-App([string]$app, [switch]$Sweep) {
     $st = Load-State
-    if (-not $st.PSObject.Properties[$app]) { return }
-    foreach ($f in @($st.$app)) { if (Test-Path $f) { [void](Invoke-Native 'icacls.exe' @($f, '/remove:d', '*S-1-1-0')) } }
-    $st.PSObject.Properties.Remove($app); Save-State $st
-    Log "снята блокировка запуска: $app"
+    $has = [bool]$st.PSObject.Properties[$app]
+    if (-not $has -and -not $Sweep) { return }
+    $dir = App-Folder $app
+    $files = @(@(if ($has) { $st.$app }) + @(if (Test-Path $dir) { Get-ChildItem -Path $dir -Filter *.exe -Recurse -Depth 2 -File -ErrorAction SilentlyContinue | ForEach-Object FullName }) |
+               Where-Object { $_ } | Select-Object -Unique)
+    foreach ($f in $files) { if (Test-Path $f) { [void](Invoke-Native 'icacls.exe' @($f, '/remove:d', '*S-1-1-0')) } }
+    if ($has) { $st.PSObject.Properties.Remove($app); Save-State $st; Log "снята блокировка запуска: $app" }
 }
 
 # ---- block_hosts: имена → адреса, в фоне ---------------------------------------
-# [Net.Dns]::GetHostAddressesAsync — круг не ждёт резолвера, а забирает готовое на
+# DNS через HTTPS к 1.1.1.1 ($DohUrl) тем же путём, что и страна: маршрут через проверенный
+# туннель (как Test-GeoPath) и сокет с адреса туннеля. Системный резолвер не годится: его
+# DNS-сервер (роутер, IPv6-DNS провайдера, после 1 с — DNS всех адаптеров) может быть мимо
+# туннеля, и имена Anthropic ушли бы провайдеру. Круг не ждёт ответа, а забирает готовое на
 # следующих кругах. Адреса копятся (объединение, не больше 256, вытесняются давно не
 # виденные) и хранятся в hosts.json — чтобы после перезагрузки правило было полным
 # ещё до первого ответа DNS. Резолвить — только пока выход через туннель: иначе запрос к
 # DNS ушёл бы с настоящего адреса; тогда в правиле адреса из кэша и встроенные ($HostsSeed).
+# VPN_GUARD_DOH_URL и VPN_GUARD_DNS_PORT — только для tests/run_windows.ps1
+$DohUrl  = if ($env:VPN_GUARD_DOH_URL) { $env:VPN_GUARD_DOH_URL } else { 'https://1.1.1.1/dns-query' }
+$DnsPort = if ($env:VPN_GUARD_DNS_PORT) { [int]$env:VPN_GUARD_DNS_PORT } else { 53 }
+# fake-IP: VPN-клиент (mihomo/Clash/Hiddify/sing-box fakeip) отвечает на обычный DNS адресами
+# из этой сети, и приложения ходят к Anthropic по ним — через туннель, мимо правила по
+# настоящим адресам. Проверка: обычный DNS-запрос (UDP 53) к тому же 1.1.1.1 через туннель —
+# такой клиент его перехватит. Подменяет — эта сеть закрыта в режимах block и hold (не в via).
+$FakeNet = '198.18.0.0/15'
+$script:FakeIp = $false
 $script:HostIps = @{}      # адрес → @{ T = когда видели (UTC); H = имя }
 $script:HostVer = 0        # растёт, когда меняется набор адресов (Get-BlockAddrs пересобирает список)
-$script:Dns = @{ Tasks = @(); Start = $NoTime; LastT = $NoTime; Want = $true }
+$script:Dns = @{ Tasks = @(); Start = $NoTime; LastT = $NoTime; Want = $true; Client = $null; Probe = $null }
 
 function Load-HostIps($conf) {
     $script:HostIps = @{}
@@ -873,8 +1008,34 @@ function Prune-HostIps($conf) {
     if ($gone) { $script:HostVer++; Save-HostIps }
 }
 
+# ответ DoH (application/dns-json) → адреса A и AAAA
+function Read-DohIps([string]$json) {
+    try { $j = $json | ConvertFrom-Json } catch { return @() }
+    @(@($j.Answer) | Where-Object { $_ -and ($_.type -eq 1 -or $_.type -eq 28) } | ForEach-Object { "$($_.data)" })
+}
+# ответ на проверку fake-IP: сменилось — в журнал (сменится и ключ правила — Set-Firewall пересоберёт)
+function Read-FakeProbe {
+    $P = $script:Dns.Probe
+    if ("$($P.Task.Status)" -eq 'RanToCompletion') {
+        $ips = @([VGNative]::DnsAnswersA($P.Task.Result.Buffer))
+        if ($ips.Count) {
+            $fake = [bool]@($ips | Where-Object { Test-InNet $_ $FakeNet }).Count
+            if ($fake -ne $script:FakeIp) {
+                $script:FakeIp = $fake
+                Log $(if ($fake) { "VPN-клиент подменяет адреса DNS (fake-IP: $($P.Host) → $($ips -join ', ')) — в режимах «закрыто» и «не уверен» закрываю и $FakeNet" }
+                      else { "VPN-клиент больше не подменяет адреса DNS ($($P.Host) → $($ips -join ', ')) — $FakeNet не закрываю" })
+            }
+        }
+    }
+    try { $P.Udp.Close() } catch {}
+    $script:Dns.Probe = $null
+}
 function Pump-Dns($conf, $e) {
     $D = $script:Dns; $now = [VGNative]::Now()
+    if ($D.Probe) {
+        $pa = $now - $D.Start
+        if ($D.Probe.Task.IsCompleted -or $pa -lt 0 -or $pa -ge 5) { Read-FakeProbe }
+    }
     if ($D.Tasks.Count) {
         $pending = @($D.Tasks | Where-Object { -not $_.Task.IsCompleted }).Count
         $age = $now - $D.Start
@@ -882,14 +1043,14 @@ function Pump-Dns($conf, $e) {
         $added = 0; $utc = [datetime]::UtcNow
         foreach ($t in $D.Tasks) {
             if ("$($t.Task.Status)" -ne 'RanToCompletion') { continue }
-            foreach ($a in $t.Task.Result) {
-                $s = $a.ToString()
+            foreach ($s in (Read-DohIps $t.Task.Result)) {
                 if (-not (Test-PublicIp $s)) { continue }
                 if (-not $script:HostIps.ContainsKey($s)) { $added++ }
                 $script:HostIps[$s] = @{ T = $utc; H = $t.Host }
             }
         }
-        $D.Tasks = @(); $D.LastT = $now
+        try { $D.Client.Dispose() } catch {}
+        $D.Tasks = @(); $D.Client = $null; $D.LastT = $now
         if ($script:HostIps.Count -gt $HostsMax) {
             $old = @($script:HostIps.Keys | Sort-Object { $script:HostIps[$_].T } | Select-Object -First ($script:HostIps.Count - $HostsMax))
             foreach ($k in $old) { $script:HostIps.Remove($k) }
@@ -906,11 +1067,32 @@ function Pump-Dns($conf, $e) {
             WarnOnce "dnsnotun:$(if ($e) { $e.Alias })" "выход $(if ($e) { "через $($e.Alias)" } else { 'не найден' }) — не туннель: имена block_hosts не резолвлю (запрос к DNS ушёл бы с настоящего адреса), в правиле адреса из кэша и встроенные"
             return
         }
+        $ip = Get-GeoIp $DohUrl
+        $i = if ($ip) { [VGNative]::BestIf($ip) } else { 0 }
+        if (-not $ip -or $i -ne $e.Index) {
+            WarnOnce "dohrt:${ip}:${i}:$($e.Index)" "маршрут к $(if ($ip) { $ip } else { $DohUrl }) (DNS через HTTPS) идёт не через туннель $($e.Alias) — имена block_hosts не резолвлю"
+            return
+        }
+        if (-not (Set-TunnelBind $DohUrl $e)) { return }
         $D.Want = $false; $D.Start = $now
+        $c = New-DirectClient 10
+        [void]$c.DefaultRequestHeaders.Accept.TryParseAdd('application/dns-json')
+        $D.Client = $c
         $D.Tasks = @(foreach ($h in $conf.block_hosts) {
-            try { @{ Host = $h; Task = [Net.Dns]::GetHostAddressesAsync($h) } } catch {}
+            foreach ($ty in 'A', 'AAAA') { try { @{ Host = $h; Task = $c.GetStringAsync("$DohUrl`?name=$h&type=$ty") } } catch {} }
         })
-        if (-not $D.Tasks.Count) { $D.LastT = $now }
+        if (-not $D.Tasks.Count) { $D.LastT = $now; try { $c.Dispose() } catch {}; $D.Client = $null }
+        # проверка fake-IP: обычный DNS к тому же адресу, тоже с адреса туннеля
+        if (-not $D.Probe) {
+            try {
+                $h0 = "$(@($conf.block_hosts)[0])"
+                $u = New-Object Net.Sockets.UdpClient -ArgumentList (New-Object Net.IPEndPoint -ArgumentList ([VGNative]::BindAddr), 0)
+                $u.Connect($ip, $DnsPort)
+                $q = [VGNative]::DnsQueryA($h0, (Get-Random -Maximum 65535))
+                [void]$u.Send($q, $q.Length)
+                $D.Probe = @{ Udp = $u; Task = $u.ReceiveAsync(); Host = $h0 }
+            } catch { WarnOnce "probe:$($_.Exception.Message)" "проверка fake-IP не удалась: $($_.Exception.Message)" }
+        }
     }
 }
 
@@ -924,7 +1106,7 @@ function Pump-Dns($conf, $e) {
 # правила. Правило есть в ActiveStore и включено, иначе — заново: проверка (~160 мс WMI)
 # раз в $FwVerifyEvery с и сразу, когда изменился реестр брандмауэра ($FwKeys: правило
 # удалили, выключили, выключили профиль) и после события сети.
-$script:Fw = @{ Key = ''; Names = @(); Mode = ''; Err = ''; ViaFail = ''; Due = $true; VerifyT = $NoTime; Stamp = ''; RepairLogT = $NoTime; ModeLog = '' }
+$script:Fw = @{ Key = ''; Names = @(); Mode = ''; Err = ''; Note = ''; ViaFail = ''; ViaFailT = $NoTime; Due = $true; VerifyT = $NoTime; Stamp = ''; RepairLogT = $NoTime; ModeLog = '' }
 $script:IfsC = @{ T = $null; Idx = $null; Ifs = @(); HasE = $false }
 $script:FwEnf = $null       # Test-FwEnforced: '' — правила действуют; $null — ещё не проверяли
 $script:FwBlind = $false    # ActiveStore наших правил не покажет (MpsSvc стоит, политика без локальных правил)
@@ -990,6 +1172,14 @@ function Set-Firewall([string]$mode, $conf, $e) {
             return
         }
         $ifs = @(); $via = ''
+        if ($mode -ne 'via') { $F.Note = '' }
+        # «только через» — только через туннель. Без него (VPN засчитан правилами proc:, adapter:,
+        # script: или require=any) «только через Wi-Fi» открыло бы прямой выход к Anthropic с
+        # настоящего адреса: закрыть везде (приложениям за системным прокси это не мешает)
+        if ($mode -eq 'via' -and $e -and -not (Test-Tunnel $e)) {
+            WarnOnce "vianotun:$($e.Alias)" "VPN засчитан, но выход через $($e.Alias) — не туннель: сеть к Anthropic закрыта везде, а не «только через» него"
+            $mode = 'block'
+        }
         if ($mode -eq 'via' -and $e) {
             # интерфейсы, кроме выхода, — пересчитать, только когда перечитан их список или сменился выход
             Update-NetCache
@@ -1006,10 +1196,14 @@ function Set-Firewall([string]$mode, $conf, $e) {
             if ($IC.HasE) { $via = "$($e.Alias)" } else { $mode = 'block'; $ifs = @() }
         } else { $mode = 'block' }
         $v6 = @(); if ($mode -eq 'via' -and $script:V6Bypass) { $v6 = @($addrs | Where-Object { "$_" -match ':' }) }
-        $blockKey = "block|||$($script:AddrC.Join)|v6:0"
-        $key = "$mode|$via|$($ifs -join ';')|$($script:AddrC.Join)|v6:$($v6.Count)"
-        # с этим набором интерфейсов правило уже не создалось — не долбить каждый круг
-        if ($mode -eq 'via' -and $key -eq $F.ViaFail) { $mode = 'block'; $ifs = @(); $via = ''; $v6 = @(); $key = $blockKey }
+        # VPN-клиент с fake-IP: в режиме «закрыто» (и «не уверен») — ещё и его сеть адресов
+        $fake = if ($script:FakeIp) { @($FakeNet) } else { @() }
+        $blockKey = "block|||$($script:AddrC.Join)|v6:0|fake:$($fake.Count)"
+        $key = if ($mode -eq 'via') { "$mode|$via|$($ifs -join ';')|$($script:AddrC.Join)|v6:$($v6.Count)|fake:0" } else { $blockKey }
+        # с этим набором интерфейсов правило уже не создалось — не долбить каждый круг, но
+        # через минуту попробовать снова (раньше — только после смены конфига)
+        $fa = [VGNative]::Now() - $F.ViaFailT
+        if ($mode -eq 'via' -and $key -eq $F.ViaFail -and $fa -ge 0 -and $fa -lt 60) { $mode = 'block'; $ifs = @(); $via = ''; $v6 = @(); $key = $blockKey }
         if ($key -eq $F.Key) {
             if (-not $F.Due) { return }
             if (Test-FwRules $F.Names) { $F.Err = ''; return }
@@ -1021,7 +1215,7 @@ function Set-Firewall([string]$mode, $conf, $e) {
         if ($mode -eq 'via') {
             if ($ifs.Count) { $specs += @{ Addr = $addrs; Ifs = $ifs; Desc = "Vafa: сеть к Anthropic только через $via" } }
             if ($v6.Count) { $specs += @{ Addr = $v6; Ifs = @(); Desc = "Vafa: IPv6 к Anthropic идёт мимо туннеля $via — IPv6-адреса закрыты везде" } }
-        } else { $specs += @{ Addr = $addrs; Ifs = @(); Desc = 'Vafa: сеть к Anthropic закрыта' } }
+        } else { $specs += @{ Addr = @($addrs + $fake); Ifs = @(); Desc = 'Vafa: сеть к Anthropic закрыта' } }
         if (-not $specs.Count) {
             # кроме выхода, интерфейсов нет (так бывает, когда в checks нет route и выход —
             # сам адаптер): закрывать нечего. Появится новый — сменится ключ, и правило встанет.
@@ -1037,10 +1231,12 @@ function Set-Firewall([string]$mode, $conf, $e) {
             if ($mode -ne 'via') { throw }
             foreach ($n in $names) { Remove-NetFirewallRule -Name $n -ErrorAction SilentlyContinue }
             WarnOnce "fwvia:$($ifs -join ';')" "не смог поставить правило «только через $via» ($($ifs -join ', ')): $($_.Exception.Message) — сеть к Anthropic закрыта полностью"
-            $F.ViaFail = $key
+            $F.ViaFail = $key; $F.ViaFailT = [VGNative]::Now()
+            $F.Note = "не смог поставить правило «только через $via» — сеть к Anthropic закрыта полностью, повтор через минуту"
             $mode = 'block'; $via = ''; $v6 = @(); $key = $blockKey
-            $names = @(New-FwRule $addrs @() 'Vafa: сеть к Anthropic закрыта')
+            $names = @(New-FwRule @($addrs + $fake) @() 'Vafa: сеть к Anthropic закрыта')
         }
+        if ($mode -eq 'via') { $F.Note = '' }
         # новое на месте — теперь снять всё прежнее (и правила старых версий Vafa)
         Remove-FwRules $names
         $F.Key = $key; $F.Names = $names; $F.Err = ''
@@ -1105,12 +1301,14 @@ function Write-Status($conf, [string]$state, $all, [bool]$scan, $e, [string]$enf
             $script:AppSig = (@($script:AppSum | ForEach-Object { "$($_.path)*$($_.locked)*$($_.procs)*$($_.frozen)" }) -join '|')
         }
         $netErr = if ($script:Fw.Err) { $script:Fw.Err } elseif (-not $script:Fw.Mode) { 'правило брандмауэра не найдено' } else { $enfErr }
+        # не ошибка защиты (сеть закрыта даже сильнее), но объяснение для щита и status
+        $netNote = if ($netErr) { $netErr } else { $script:Fw.Note }
         $G = $script:Geo; $cc = Geo-Shown; $now = [VGNative]::Now()
         $iface = if ($e) { "$($e.Alias)" } else { '' }
         $ga = $now - $G.GoodT
         $country = if ($cc -and $ga -ge 0 -and $ga -lt [Math]::Max(60, $conf.geo_stale)) { $cc } else { '' }
         $geo = [bool](@($conf.checks) -match '^geo(:|$)')
-        $sig = "$state|$iface|$country|$($script:Fw.Mode)|$netErr|$($conf.on_down)|$(@($conf.block_countries) -join ',')|$geo|$($script:AppSig)"
+        $sig = "$state|$iface|$country|$($script:Fw.Mode)|$netErr|$netNote|$($conf.on_down)|$(@($conf.block_countries) -join ',')|$geo|$($script:AppSig)"
         $sa = $now - $script:StatusT
         if ($sig -eq $script:StatusSig -and $sa -ge 0 -and $sa -lt $StatusEvery) { return }
         $o = [pscustomobject]@{
@@ -1121,7 +1319,7 @@ function Write-Status($conf, [string]$state, $all, [bool]$scan, $e, [string]$enf
             on_down = $conf.on_down
             countries = @($conf.block_countries)
             geo = $geo
-            net = $script:Fw.Mode; net_ok = (-not $netErr); net_error = "$netErr"
+            net = $script:Fw.Mode; net_ok = (-not $netErr); net_error = "$netNote"
             apps = @($script:AppSum)
         }
         [IO.File]::WriteAllText($tmp, ($o | ConvertTo-Json -Depth 4 -Compress), (New-Object Text.UTF8Encoding $false))
@@ -1193,8 +1391,16 @@ function Cmd-Daemon {
     $last = 'init'; $downSince = $null; $lastLock = $NoTime; $blocked = $false
     $state = 'init'; $scanT = $NoTime; $scanState = ''
     $sw = New-Object Diagnostics.Stopwatch
+    $prevT = $null
     while ($true) {
         $sw.Restart(); $t0 = [VGNative]::Now(); $script:TickT = $t0
+        # перерыв между кругами (сон, гибернация): страну ждать заново с «не уверен», а не сразу
+        # down по geo_stale — свежий ответ придёт через секунду (Get-GeoVerdict, ResumeT)
+        if ($null -ne $prevT -and ($t0 - $prevT -gt $GapSec -or $t0 -lt $prevT)) {
+            $script:ResumeT = $t0
+            Log "перерыв $([int]($t0 - $prevT)) с между кругами (сон?) — страну спрашиваю заново"
+        }
+        $prevT = $t0
         try {
             $m = Get-ConfTime
             if ($m -ne $mt -or $confBad) {
@@ -1220,8 +1426,12 @@ function Cmd-Daemon {
             # состояние брандмауэра — до проверки VPN: от него зависит, можно ли пустить IPv6 мимо туннеля
             if ($script:Fw.Due -or $null -eq $script:FwEnf) { $script:FwEnf = Test-FwEnforced }
             $e = Get-EgressAdapter
+            # выход не через туннель: страну туннеля забыть и начатый запрос отменить, даже если
+            # до проверки geo дело не дойдёт (route — «нет» первым): иначе в статусе и щите
+            # «интерфейс: Ethernet, страна: FR» (замер с sing-box 2026-10-10)
+            if ((@($conf.checks) -match '^geo(:|$)') -and -not (Test-Tunnel $e)) { Stop-Geo $e }
             $D = $script:Dns; $da = $t0 - $D.LastT
-            if ($D.Tasks.Count -or (@($conf.block_hosts).Count -and ($D.Want -or $da -lt 0 -or $da -ge $conf.hosts_ttl))) { Pump-Dns $conf $e }
+            if ($D.Tasks.Count -or $D.Probe -or (@($conf.block_hosts).Count -and ($D.Want -or $da -lt 0 -or $da -ge $conf.hosts_ttl))) { Pump-Dns $conf $e }
             # проверка упала — «не уверен»: сеть закрыта, приложения не трогаем, статус пишется
             $script:V6Bypass = $false
             try { $v = Get-VpnVerdict $conf $e } catch { WarnOnce "verdict:$_" "ошибка проверки VPN: $_ — считаю «не уверен»"; $v = $null }
@@ -1326,7 +1536,7 @@ function Cmd-Supervise {
     try { [Diagnostics.Process]::GetCurrentProcess().PriorityClass = [Diagnostics.ProcessPriorityClass]::Normal } catch {}
     $ps = Join-Path $PSHOME 'powershell.exe'
     $argv = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$PSCommandPath`" daemon"
-    $oSeen = $null; $oSeenT = [VGNative]::Now()
+    $oSeen = $null; $oSeenT = [VGNative]::Now(); $oPoll = $oSeenT
     while ($true) {
         # демон ещё жив (осиротел после убитого сторожа) — не плодить копии, ждать; но и
         # за ним смотреть: status.json не меняется $HangSec с — убить
@@ -1334,12 +1544,14 @@ function Cmd-Supervise {
         if ([Threading.Mutex]::TryOpenExisting('Global\VPNGuardDaemon', [ref]$m)) {
             $m.Dispose()
             $t = Get-StatusStamp; $now = [VGNative]::Now()
-            if ($t -ne $oSeen -or $now - $oSeenT -lt 0) { $oSeen = $t; $oSeenT = $now }
+            # между опросами прошло много больше 2 с — машина спала: отсчёт заново (как ниже)
+            if ($t -ne $oSeen -or $now - $oSeenT -lt 0 -or $now - $oPoll -gt 15 -or $now -lt $oPoll) { $oSeen = $t; $oSeenT = $now }
             elseif ($now - $oSeenT -ge $HangSec) {
                 Log "служба не обновляет status.json $([int]($now - $oSeenT)) с — зависла, перезапускаю"
                 Stop-Daemons -DaemonOnly
                 $oSeen = $null; $oSeenT = $now
             }
+            $oPoll = $now
             Start-Sleep 2; continue
         }
         try {
@@ -1441,9 +1653,9 @@ function Cmd-Unlock {
     } catch {}
     Stop-Daemons
     $st = Load-State
-    foreach ($a in $st.PSObject.Properties.Name) { Unlock-App $a }
     $conf = Try-LoadConf; if ($null -eq $conf) { $conf = Default-Conf }
     $apps = @(@($conf.apps) + @($st.PSObject.Properties.Name) | Where-Object { $_ } | Select-Object -Unique)
+    foreach ($a in $apps) { Unlock-App $a -Sweep }
     $all = @(Get-ProcsIn $apps)
     foreach ($a in $apps) { Resume-App $a $all }
     Remove-FwRules

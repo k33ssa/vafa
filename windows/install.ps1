@@ -16,7 +16,12 @@ Get-ChildItem $Dest -File | ForEach-Object { $_.IsReadOnly = $false }
 # ProgramData\VPNGuard: писать могут только SYSTEM и администраторы, читать — все
 # (иначе любой пользователь поменял бы список, а служба от SYSTEM его исполнила бы)
 # (icacls — с ErrorActionPreference=Continue: его stderr при Stop стал бы исключением)
+# Владелец — Администраторы: если папку заранее создал обычный пользователь, он, как владелец,
+# мог бы в любой момент вернуть себе право записи и подменить config.json (служба такой конфиг
+# теперь не читает — Test-ConfSafe проверяет владельца и права папки)
 & { $ErrorActionPreference = 'Continue'
+    & icacls.exe $Root /setowner '*S-1-5-32-544' /T /C /Q 2>&1 | Out-Null
+    if ($LASTEXITCODE) { throw "icacls $Root /setowner: код $LASTEXITCODE" }
     & icacls.exe $Root /inheritance:r /grant:r '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F' '*S-1-5-32-545:(OI)(CI)RX' 2>&1 | Out-Null
     if ($LASTEXITCODE) { throw "icacls $Root`: код $LASTEXITCODE" }
     # файлы внутри — только унаследованные права (старые ручные правки ACL убрать)
@@ -44,6 +49,26 @@ if (-not (Test-Path $conf)) {
         $j | Add-Member -NotePropertyName block_countries -NotePropertyValue $cc
         Save-Conf $j
         Write-Host "Страны блокировки: $($cc -join ' ')"
+    }
+    # block_countries испорчен: строка «RU,CN» или {"value": [...], "Count": N} — так PowerShell 5.1
+    # записывал массив установщиком d674bf9 (без Remove-TypeData). Служба такое уже понимает, но
+    # трей и ручная правка ждут массив кодов — переписать массивом
+    $j = Get-Content $conf -Raw -Encoding UTF8 | ConvertFrom-Json
+    if ($j.PSObject.Properties.Name -contains 'block_countries') {
+        $raw = $j.block_countries
+        $okList = ($raw -is [array]) -and -not @($raw | Where-Object { $_ -isnot [string] -or $_ -notmatch '^[A-Z]{2}$' }).Count
+        if (-not $okList) {
+            $flat = foreach ($x in @($raw)) {
+                if ($null -eq $x) { continue }
+                if ($x -isnot [string] -and $x.PSObject.Properties['value']) { $x = $x.value }
+                foreach ($y in @($x)) { "$y" -split '[,;\s]+' }
+            }
+            $cc = @(@($flat) | ForEach-Object { "$_".Trim().ToUpper() } | Where-Object { $_ -match '^[A-Z]{2}$' } | Select-Object -Unique)
+            if (-not $cc.Count -and @(@($raw) | Where-Object { $null -ne $_ -and "$_".Trim() }).Count) { $cc = @('RU', 'CN', 'BY', 'IR') }
+            $j | Add-Member -NotePropertyName block_countries -NotePropertyValue $cc -Force
+            Save-Conf $j
+            Write-Host "Страны блокировки (исправлен испорченный список): $(if ($cc) { $cc -join ' ' } else { 'не заданы' })"
+        }
     }
     # старые значения по умолчанию (опрос раз в 2 с, страна раз в 15 с) — на раз в секунду;
     # если их меняли руками, не трогать
@@ -93,6 +118,7 @@ Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" |
     Where-Object { $_.CommandLine -match 'vpn-guard\.ps1.*\s(daemon|supervise)\b' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
 Unregister-ScheduledTask -TaskName VPNGuard -Confirm:$false -ErrorAction SilentlyContinue
 Register-ScheduledTask -TaskName VPNGuard -Action $action -Trigger $trigger -Principal $princ -Settings $set | Out-Null
+$t0 = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
 Start-ScheduledTask -TaskName VPNGuard
 
 # трей: ярлык в «Пуск», автозапуск у текущего пользователя, запуск сразу
@@ -122,7 +148,19 @@ if ($user) {
     Unregister-ScheduledTask -TaskName VPNGuardTrayOnce -Confirm:$false
 }
 
+# служба должна записать свежий status.json — иначе она не запустилась (например, не
+# компилируется встроенный код): сказать сразу, а не оставить молча без защиты
+$ok = $false
+for ($i = 0; $i -lt 60 -and -not $ok; $i++) {
+    try { $ok = [long]((Get-Content "$Root\status.json" -Raw -Encoding UTF8 | ConvertFrom-Json).time) -ge $t0 } catch {}
+    if (-not $ok) { Start-Sleep -Milliseconds 500 }
+}
 Write-Host ''
+if ($ok) { Write-Host 'Служба работает (status.json обновляется).' }
+else {
+    Write-Host 'ВНИМАНИЕ: служба за 30 с не записала status.json — похоже, она не запустилась. Последние строки журнала:'
+    Get-Content "$Root\vpn-guard.log" -Tail 10 -Encoding UTF8 -ErrorAction SilentlyContinue | ForEach-Object { Write-Host "  $_" }
+}
 Write-Host "Установлено: $Dest"
 Write-Host "Журнал:      $Root\vpn-guard.log"
 Write-Host "Проверить:   powershell -ExecutionPolicy Bypass -File `"$Dest\vpn-guard.ps1`" status   (от администратора)"

@@ -68,7 +68,9 @@ STATUS_FILE=$STATE_DIR/status.json
 typeset -gA TERMED=()
 typeset -gA WARNED=()
 typeset -gA LOGGED_T=()
-typeset -g CUR_IF=''   # интерфейс маршрута по умолчанию — один снимок на круг
+typeset -g CUR_IF=''   # интерфейс маршрута к Anthropic (ROUTE_PROBE) — один снимок на круг
+# api.anthropic.com — как $RouteProbes в windows/vpn-guard.ps1
+ROUTE_PROBE=${VPN_GUARD_ROUTE_PROBE:-160.79.104.10}
 
 # ---- служебное --------------------------------------------------------------
 log() {
@@ -342,7 +344,11 @@ conf_mtime() {
 
 # ---- определение VPN --------------------------------------------------------
 # VPN_GUARD_IFACE_FILE — только для tests/run_macos.sh: имя интерфейса берётся из файла
-# интерфейс маршрута по умолчанию — в REPLY (один процесс route, без awk и подоболочки)
+# интерфейс, через который реально уйдёт пакет к Anthropic — в REPLY (один процесс route,
+# без awk и подоболочки). Не `route get default`: Happ 4.5 (xray) не трогает default, а
+# ставит туннель кусками 1/8, 2/7 … 64/2, 128/1 — без 0/8, так что default и сам адрес
+# 0.0.0.0 остаются на en0, хотя весь интернет идёт через utunN (2026-11-03: Vafa держала
+# «VPN нет» при немецком выходе). С 0/1 + 128/1 (OpenVPN, WireGuard) оба способа совпадают.
 default_iface_r() {
   REPLY=''
   if [[ -n ${VPN_GUARD_IFACE_FILE:-} ]]; then
@@ -351,7 +357,7 @@ default_iface_r() {
     return 0
   fi
   local out
-  out=$(route -n get default 2>/dev/null)
+  out=$(route -n get $ROUTE_PROBE 2>/dev/null)
   [[ $out == *'interface: '* ]] || return 0
   out=${out#*interface: }
   REPLY=${${out%%$'\n'*}//[[:space:]]/}
@@ -375,7 +381,7 @@ _nc_connected() {
 }
 
 # страна, из которой нас видит интернет (Cloudflare trace). Кэш на GEO_TTL секунд,
-# сбрасывается при смене интерфейса маршрута по умолчанию и по событию сети.
+# сбрасывается при смене интерфейса маршрута (CUR_IF) и по событию сети.
 # Глобальные переменные, потому что _one_check нельзя звать в подоболочке — кэш бы терялся.
 #
 # Спрашиваем через сам туннель (curl --interface utunN): страна та же, что видит
@@ -1039,7 +1045,10 @@ typeset -g TUN_ID='' TUN_IDX=''   # «паспорт» туннеля, чере�
 
 # паспорт интерфейса — в REPLY (VPN_GUARD_IFACE_FILE.id — для тестов)
 tun_id_r() {
-  local i=$1 out idx='' addr=''
+  local i=${1:-} out idx='' addr=''
+  # маршрута нет (CUR_IF пуст): с голым $1 под nounset демон падал — 2026-11-03 14:34:52
+  # «tun_id_r:1: 1: parameter not set», а ifconfig -v без имени выдал бы все интерфейсы
+  [[ -n $i ]] || { REPLY=''; return 0 }
   if [[ -n ${VPN_GUARD_IFACE_FILE:-} ]]; then
     REPLY=''; [[ -r $VPN_GUARD_IFACE_FILE.id ]] && REPLY=$(<$VPN_GUARD_IFACE_FILE.id)
     REPLY=${REPLY//[[:space:]]/}

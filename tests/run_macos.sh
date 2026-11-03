@@ -576,6 +576,17 @@ check "после удаления из списка — разморожено"
 check "и +x вернули" test -x $T/Fake.app/Contents/MacOS/fake
 stop_daemon; geo DE
 
+# ---- 43. маршрут пропал посреди события сети — демон не падает -----------------------
+# журнал 2026-11-03 14:34:52: «tun_id_r:1: 1: parameter not set» — пустой CUR_IF под set -u
+print "43. маршрут пропал при событии сети"
+pf_reset; print -r -- 'utun9|29|10.8.0.2' > $T/iface.id; INTERVAL=1 conf route geo; geo DE
+start_daemon; vpn_is true 5
+: > $T/iface; event CHANGE; sleep 2
+check "демон жив" kill -0 $DPID
+check "без маршрута — VPN нет" vpn_is false 5
+check "в журнале нет «parameter not set»" eval '! grep -q "parameter not set" $T/daemon.log'
+stop_daemon; rm -f $T/iface.id; iface utun9
+
 print
 print "итог: прошло $PASS, упало $FAIL"
 (( FAIL == 0 ))

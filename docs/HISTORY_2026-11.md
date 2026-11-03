@@ -17,7 +17,8 @@
 `ROUTE_PROBE=160.79.104.10` (как Windows-версия); `tun_id_r` не падает на пустом имени.
 Проверено вырезанными функциями на живой таблице: новый способ — `utun225`, старый — `en0`.
 `tests/run_macos.sh` — 154/154, новый тест 43 (маршрут пропал при событии сети — демон жив).
-Слито в `main`, отправлено на GitHub. На живую систему не ставилось — нужен `sudo ./install.sh`.
+Слито в `main`, отправлено на GitHub. Пользователь поставил (`sudo ./install.sh`, 17:01):
+`status.json` — `state:up`, `net:via:utun225`, `net_ok:true`, страна DE.
 
 Файлы: `vpn-guard`, `tests/run_macos.sh`, `CLAUDE.md`, `TODO.md`, `docs/ПОДРОБНО.md`,
 `docs/HISTORY_2026-11.md` (новый).

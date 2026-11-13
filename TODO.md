@@ -37,23 +37,34 @@
   (б) DNS-запросы имён Anthropic идут мимо туннеля открыто — содержимое не утекает, но факт обращения виден.
   (в) Network Extension (как LuLu/FreeSnitch) — привязка сети к процессу, но платный Developer ID, одобрение
   пользователя и fail-open у обоих по умолчанию. Если делать — только поверх pf (pf остаётся при сбое NE).
-* [ ] **Предложить пользователю** (13.11, по коду, не сделано): (1) страна — фоновым запросом, как на Windows:
-  сейчас `_geo_fetch` синхронный, `--max-time 4` × 2 адреса — при зависшем туннеле круг стоит до ~8 с и заморозка
-  ждёт; (2) по событию сети, если маршрута через туннель нет, — `pf block` и заморозка сразу, до сбора пачки
-  событий (0,1–0,5 с); (3) Windows: `NotifyRouteChange2`/`NotifyIpInterfaceChange` вместо одного
-  `NetworkAddressChanged`.
-* [ ] Happ/xray: пакет входит в utun, но внутри xray может уйти «direct» (правила маршрутизации по гео/домену) —
-  тогда выход российский, а Vafa видит utun. Страна проверяется только для 1.1.1.1. Посмотреть правила Happ
-  (локально, без сети) и решить, нужно ли проверять страну ещё и к адресу Anthropic.
-* [ ] Хосты Claude (агент по докам Anthropic + `lsof` 10 мин 13.11): Desktop ходил только к 160.79.104.10 и
-  GitHub (140.82.121.5/6); CLI — 160.79.104.10, Datadog us5 34.149.66.165 (уже в таблице), GitHub raw,
-  2.23.90.85 (Akamai, не опознан). Кандидаты в `BLOCK_HOSTS` (выделенные Anthropic, по докам): mcp-proxy.anthropic.com,
-  releases.claude.com, a.claude.ai, a-api.anthropic.com, assets-proxy.anthropic.com, sso.claude.com,
-  bridge.claudeusercontent.com. Перед добавлением проверить через туннель, что адреса не общие (Cloudflare).
-  Отключить телеметрию Claude Code — `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1` (см. §0, решает пользователь).
+* [ ] Windows: страна спрашивается асинхронно уже давно; события сети — только `NetworkAddressChanged`.
+  Добавить `NotifyRouteChange2`/`NotifyIpInterfaceChange` (пропажа адаптера без смены адреса ловится по таймеру).
+* [ ] Windows: режим системного прокси (как `PROXY_MODE` на macOS) — не сделано, нечем проверить.
+* [ ] Happ (13.11, по файлам, VPN не трогался): свои правила маршрутизации пустые (`~/Library/Preferences/Happ/
+  routing.json`), но `providerRoutingDisabled: false` — провайдер подписки может прислать свои, а подписка
+  в `subs.db` зашифрована. Если провайдер шлёт «direct» для чего-то — пакет зайдёт в utun, а выйдет с RU-адреса.
+  Посмотреть в интерфейсе Happ, есть ли правила провайдера; надёжно — выключить их там (решает пользователь).
+* [ ] **Решение пользователя:** морозить ли Claude Code CLI (сейчас защищён только сетью). Три копии на этом
+  Маке: `/opt/homebrew/…/claude-code/bin/claude.exe`, `~/.npm-global/…/claude.exe`, `~/Library/Application
+  Support/Claude/claude-code/<версия>/claude.app` — у всех подпись `Q6L2SF6YDW:com.anthropic.claude-code`.
+  Цена: при падении VPN замрут и агентские сессии посреди работы (оживут с VPN); запуск `claude` закрыт.
 * [ ] Windows: поиск копий по подписи (Authenticode) — как `MATCH_SIGNATURE` на macOS; не сделано, нечем проверить.
 
 ## §2. Закрыто
+
+### 2026-11-13 (вечер) — страна в фоне, режим прокси, имена
+
+* [x] Страна спрашивается в фоне (`_geo_refresh`, GEO_ASYNC): зависший туннель не держит круг (было до ~12 с);
+  после события ждём ответа до `GEO_WAIT=1` с; без туннеля по событию — круг сразу, без сбора пачки.
+  Тест 45. Нагрузка не выросла: 4,4 % → 4,3 % ядра (замер на подменах, 30 с).
+* [x] Режим системного прокси (`PROXY_MODE=auto`, `PROXY_APPS`): засчитывается локальный порт VPN-клиента,
+  страна — через прокси, pf — block. Щит пишет «через прокси …». Тест 46. Цена ≈1 % ядра, только без туннеля.
+* [x] 7 имён Anthropic из доков (mcp-proxy, releases, a.claude.ai, a-api, assets-proxy, sso, bridge.claudeusercontent)
+  и ещё 6 — DoH через utun225 13.11: все 160.79.104.10, уже закрыты `160.79.104.0/21`. Добавлять нечего.
+  Соединения Claude за 10 мин (`lsof`): Desktop — Anthropic и GitHub; CLI — Anthropic, Datadog us5 (закрыт),
+  GitHub, 2.23.90.85 (Akamai, не опознан); всё через utun225.
+* [x] `tests/run_macos.sh` — 180/180. Новый щит (NSApplicationMain + прокси) собран в `app/Vafa.app`;
+  на живую систему не поставлен — `sudo ./install.sh` делает пользователь.
 
 ### 2026-11-13 — копии приложения по подписи
 

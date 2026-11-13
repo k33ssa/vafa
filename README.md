@@ -16,7 +16,13 @@
 
 ### Установка
 
-Нужны Xcode Command Line Tools (один раз: `xcode-select --install`).
+Через Homebrew (обновление — `brew upgrade`):
+
+```bash
+brew install --cask k33ssa/tap/vafa
+```
+
+Или из исходников. Нужны Xcode Command Line Tools (один раз: `xcode-select --install`).
 
 ```bash
 cd ~

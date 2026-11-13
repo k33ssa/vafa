@@ -50,6 +50,15 @@ ON_DOWN=freeze       # freeze | kill
 LOCK_LAUNCH=1
 MATCH_ANY_PATH=0
 MATCH_SIGNATURE=1    # ловить копии бандла в другой папке по подписи (команда + bundle id)
+FREEZE_CLI=${VPN_GUARD_FREEZE_CLI:-1}   # морозить и Claude Code CLI (все копии, с дочерними процессами) и запрещать его запуск
+# подписи CLI (шаблоны zsh) и где лежат его исполняемые файлы (для запрета запуска)
+typeset -ga CLI_SIGS=( 'Q6L2SF6YDW:com.anthropic.claude-code' )
+typeset -ga CLI_GLOBS=( '/opt/homebrew/lib/node_modules/@anthropic-ai/claude-code/bin/claude.exe'
+                        '/usr/local/lib/node_modules/@anthropic-ai/claude-code/bin/claude.exe'
+                        '/Users/*/.npm-global/lib/node_modules/@anthropic-ai/claude-code/bin/claude.exe'
+                        '/Users/*/.local/share/claude/versions/*'
+                        '/Users/*/Library/Application Support/Claude/claude-code/*/*/claude.app/Contents/MacOS/claude' )
+CLI_KEY='cli:Claude Code CLI'
 INTERVAL=1
 GRACE=0
 NOTIFY=1
@@ -180,7 +189,7 @@ validate_conf() {
   # 0/1: под set -u «LOCK_LAUNCH=yes» в (( )) — обращение к переменной yes, и блокировка
   # запуска молча выключалась
   local v d
-  for v d in LOCK_LAUNCH 1 NOTIFY 1 NET_WATCH 1 MATCH_ANY_PATH 0 MATCH_SIGNATURE 1 GEO_BIND 1; do
+  for v d in LOCK_LAUNCH 1 NOTIFY 1 NET_WATCH 1 MATCH_ANY_PATH 0 MATCH_SIGNATURE 1 FREEZE_CLI 1 GEO_BIND 1; do
     [[ ${(P)v:-} == (0|1) ]] || { log "$v=${(P)v:-} — беру $d"; typeset -g $v=$d }
   done
   # одна кривая запись в таблице pf роняет загрузку всех правил — такие выкидываем;
@@ -749,17 +758,145 @@ app_pids() {
   for l in $reply[@]; do print -r -- ${l%% *}; done
 }
 
+# lock_app <бандл> — все файлы Contents/MacOS; lock_app <ключ> <файлы…> — свой список (CLI)
+# ---- Claude Code CLI (FREEZE_CLI) ---------------------------------------------
+# Три вида установки: npm/Homebrew (голый claude.exe), нативная (~/.local/share/claude/
+# versions/…), копия внутри Claude.app (…/claude-code/<версия>/…/claude.app). У всех подпись
+# Q6L2SF6YDW:com.anthropic.claude-code — по ней и ловим, где бы ни лежал. Морозим вместе с
+# потомками: команды, которые запустил агент (git, npm, curl…), иначе они шли бы в сеть
+# с настоящего адреса. Заморозка — SIGSTOP: сессия ждёт, с VPN продолжит (запрос к API,
+# висевший в момент заморозки, может оборваться по таймауту — CLI его повторит или покажет ошибку).
+typeset -g CLI_FROZEN=0
+
+# подпись отдельного исполняемого файла (как bundle_sig_r) → REPLY
+file_sig_r() {
+  local f=$1 k line id='' team='' cd=''
+  local -A h
+  REPLY=''
+  zstat -H h -- $f 2>/dev/null || return 1
+  k="${h[inode]}:${h[mtime]}"
+  if [[ -n ${SIGC[f:$f]:-} && ${SIGC[f:$f]%%|*} == $k ]]; then REPLY=${SIGC[f:$f]#*|}; return 0; fi
+  for line in ${(f)"$(codesign -dvvv -- $f 2>&1)"}; do
+    case $line in
+      Identifier=*) id=${line#*=} ;;
+      TeamIdentifier=*) team=${line#*=} ;;
+      CDHash=*) cd=${line#*=} ;;
+    esac
+  done
+  if [[ -n $id && -n $team && $team != 'not set' ]]; then REPLY="$team:$id"
+  elif [[ -n $id && -n $cd ]]; then REPLY="adhoc:$id:$cd"; fi
+  SIGC[f:$f]="$k|$REPLY"
+  return 0
+}
+cli_sig_ok() {
+  local p
+  for p in $CLI_SIGS[@]; do
+    # тесты (VPN_GUARD_TEST=1) гоняют демон от пользователя на настоящем списке процессов:
+    # настоящую подпись CLI не трогать никогда — иначе заморозили бы живые сессии
+    [[ ${VPN_GUARD_TEST:-} == 1 && $1 == Q6L2SF6YDW:* ]] && return 1
+    [[ $1 == ${~p} ]] && return 0
+  done
+  return 1
+}
+
+# процессы CLI из снимка («pid stat») → reply. Голые бинари — по имени claude/claude.exe
+# и подписи файла; бандлы — из индекса подписей (sig_scan).
+cli_procs_r() {
+  setopt local_options extended_glob
+  local line rest k
+  local -a w out=()
+  reply=()
+  [[ -n $PS_SNAP ]] || ps_snap
+  if (( ${+APC[$CLI_KEY]} )); then reply=( ${(f)APC[$CLI_KEY]} ); return 0; fi
+  for line in ${(M)${(f)PS_SNAP}:#*/claude(|.exe)}; do
+    w=( ${=line} ); (( ${#w} >= 3 )) || continue
+    rest=${line##[[:space:]]#[0-9]##[[:space:]]##[^[:space:]]##[[:space:]]##}
+    [[ $rest == *.app/* ]] && continue
+    file_sig_r $rest && [[ -n $REPLY ]] && cli_sig_ok $REPLY && out+=( "$w[1] $w[2]" )
+  done
+  sig_scan
+  for k in ${(k)SIGP}; do cli_sig_ok $k && out+=( ${(f)SIGP[$k]} ); done
+  reply=( $out[@] )
+  APC[$CLI_KEY]=${(F)reply}
+}
+
+# корни + все потомки (pid) → reply; дерево — отдельным ps с ppid, только когда морозим/будим
+cli_tree_r() {
+  local l
+  local -a roots=() w q=()
+  local -A kids=() seen=()
+  cli_procs_r
+  for l in $reply[@]; do roots+=( ${l%% *} ); done
+  reply=()
+  (( ${#roots} )) || return 0
+  for l in ${(f)"$(ps -axo pid=,ppid= 2>/dev/null)"}; do
+    w=( ${=l} ); (( ${#w} == 2 )) || continue
+    kids[$w[2]]+=" $w[1]"
+  done
+  q=( $roots[@] )
+  while (( ${#q} )); do
+    l=$q[1]; q=( ${q[2,-1]} )
+    (( ${+seen[$l]} )) && continue
+    (( l > 1 && l != $$ )) || continue
+    seen[$l]=1; reply+=( $l )
+    q+=( ${=kids[$l]:-} )
+  done
+}
+
+freeze_cli() {
+  local l pid n=0 live=0
+  cli_procs_r
+  for l in $reply[@]; do [[ ${l#* } == T* ]] || live=1; done
+  (( live )) || return 0   # все уже заморожены — дерево не перебирать каждый круг
+  cli_tree_r
+  for pid in $reply[@]; do kill -STOP $pid 2>/dev/null && (( n++ )); done
+  (( n )) && { CLI_FROZEN=1; PS_DIRTY=1; log_every clifreeze 60 "Claude Code CLI: заморожено процессов $n (с дочерними)" }
+  return 0
+}
+
+resume_cli() {
+  local l pid n=0 any=0
+  cli_procs_r
+  for l in $reply[@]; do [[ ${l#* } == T* ]] && any=1; done
+  (( CLI_FROZEN || any )) || return 0
+  cli_tree_r
+  for pid in $reply[@]; do kill -CONT $pid 2>/dev/null && (( n++ )); done
+  CLI_FROZEN=0; PS_DIRTY=1
+  log "Claude Code CLI: разморожено (процессов $n)"
+  return 0
+}
+
+# исполняемые файлы CLI на диске (для запрета запуска) → reply
+# Только файлы с подписью CLI: шаблон мог задеть чужое, а в тестах (VPN_GUARD_TEST=1)
+# cli_sig_ok не пропускает настоящую подпись — тестовый демон не снимет +x с живого claude.
+cli_files_r() {
+  local g f
+  local -a out=()
+  for g in $CLI_GLOBS[@]; do
+    for f in ${~g}(N.); do
+      file_sig_r $f && [[ -n $REPLY ]] && cli_sig_ok $REPLY && out+=( $f )
+    done
+  done
+  reply=( $out[@] )
+}
+lock_cli() { cli_files_r; (( ${#reply} )) && lock_app $CLI_KEY $reply[@]; return 0 }
+
 lock_app() {
   local app=$1
   local exedir=$app/Contents/MacOS
   state_key_r $app
   local stfile=$PERM_DIR/$REPLY
-  if [[ ! -d $exedir ]]; then
-    warn_once "noexe:$app" "не нашёл $exedir — проверь путь в конфиге"
-    return 1
+  local -a files
+  if (( $# > 1 )); then
+    files=( ${@[2,-1]} ); exedir=${files[1]:h}
+  else
+    if [[ ! -d $exedir ]]; then
+      warn_once "noexe:$app" "не нашёл $exedir — проверь путь в конфиге"
+      return 1
+    fi
+    files=( $exedir/*(.N) )
+    (( ${#files} )) || { warn_once "empty:$app" "в $exedir нет исполняемых файлов"; return 1 }
   fi
-  local -a files=( $exedir/*(.N) )
-  (( ${#files} )) || { warn_once "empty:$app" "в $exedir нет исполняемых файлов"; return 1 }
 
   local had_state=0
   [[ -e $stfile ]] && had_state=1
@@ -1224,7 +1361,16 @@ write_status() {
     json_str $a; out+="$sep{\"path\":$REPLY,\"locked\":$lk,\"procs\":$n,\"frozen\":$fz}"
     sep=,
   done
-  out+="]}"
+  out+="]"
+  if (( FREEZE_CLI )); then
+    n=0 fz=0 lk=false
+    cli_procs_r
+    for l in $reply[@]; do (( n++ )); [[ ${l#* } == T* ]] && (( fz++ )); done
+    state_key_r $CLI_KEY
+    [[ -e $PERM_DIR/$REPLY ]] && lk=true
+    out+=",\"cli\":{\"locked\":$lk,\"procs\":$n,\"frozen\":$fz}"
+  fi
+  out+="}"
   { print -r -- $out > $tmp && zf_chmod 644 $tmp && zf_mv -f $tmp $STATUS_FILE } 2>/dev/null
   return 0
 }
@@ -1238,6 +1384,7 @@ prune_stale_locks() {
     app=${app#\# app: }
     [[ -n $app ]] || continue
     (( ${APPS[(Ie)$app]} )) && continue   # (Ie): путь как есть, а не шаблон — «Foo (Beta).app»
+    [[ $app == $CLI_KEY ]] && (( FREEZE_CLI )) && continue
     log "$app убран из конфига — снимаю блокировку"
     unlock_app $app
   done
@@ -1485,6 +1632,8 @@ cmd_daemon() {
           unlock_app $a
           resume_app $a
         done
+        unlock_app $CLI_KEY
+        resume_cli
         ;;
       (unsure)
         pf_apply hold                 # приложения не трогаем — ни морозим, ни размораживаем
@@ -1508,8 +1657,15 @@ cmd_daemon() {
             (kill)   kill_app $a ;;
           esac
         done
+        # CLI — всегда заморозка (не kill): закрытие убило бы работу агента
+        if (( FREEZE_CLI )); then
+          (( LOCK_LAUNCH )) && lock_cli
+          freeze_cli
+        fi
         ;;
     esac
+    # CLI убрали из охраны (FREEZE_CLI=0), пока он заморожен, — разморозить и вернуть запуск
+    if (( ! FREEZE_CLI && CLI_FROZEN )); then resume_cli; unlock_app $CLI_KEY; fi
     write_status $state
     prev_state=$state
     wait_tick
@@ -1623,6 +1779,7 @@ cmd_unlock() {
   load_conf >/dev/null 2>&1
   local a
   for a in $APPS[@]; do resume_app $a >/dev/null; done
+  CLI_FROZEN=1; resume_cli >/dev/null 2>&1
   pf_off
   PF_WANT=''
   write_status stopped   # чтобы щит не показывал «сеть закрыта» от остановленного демона

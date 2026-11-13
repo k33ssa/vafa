@@ -23,6 +23,12 @@ struct AppState: Decodable {
     let frozen: Int
 }
 
+struct CliState: Decodable {
+    let locked: Bool
+    let procs: Int
+    let frozen: Int
+}
+
 struct GuardStatus: Decodable {
     let time: Double
     let vpn: Bool
@@ -40,6 +46,8 @@ struct GuardStatus: Decodable {
     let net_error: String?
     // nil/пусто — не режим прокси; иначе URL системного прокси VPN-клиента
     let proxy: String?
+    // nil — CLI не под охраной (FREEZE_CLI=0) или старый демон
+    let cli: CliState?
 }
 
 enum Level { case up, unsure, down }
@@ -315,6 +323,11 @@ struct StatusView: View {
                     Text(n.text).foregroundColor(n.color.map { Color(nsColor: $0) } ?? .secondary)
                         .fixedSize(horizontal: false, vertical: true)
                 }
+                if let c = s.cli {
+                    Text("Claude Code CLI — запуск: \(c.locked ? "ЗАБЛОКИРОВАНО" : "разблокировано"), процессов: \(c.procs)"
+                         + (c.frozen > 0 ? ", заморожено: \(c.frozen)" : ""))
+                        .foregroundColor(c.frozen > 0 ? .red : .primary)
+                }
                 ForEach(s.apps, id: \.path) { a in
                     Text("\(appName(a.path)) — запуск: \(a.locked ? "ЗАБЛОКИРОВАНО" : "разблокировано"), процессов: \(a.procs)"
                          + (a.frozen > 0 ? ", заморожено: \(a.frozen)" : ""))
@@ -449,6 +462,12 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 var line = "   запуск: \(a.locked ? "ЗАБЛОКИРОВАНО" : "разблокировано"), процессов: \(a.procs)"
                 if a.frozen > 0 { line += ", заморожено: \(a.frozen)" }
                 info(line, color: a.frozen > 0 ? .systemRed : nil)
+            }
+            if let c = s.cli {
+                info("Claude Code CLI", bold: true)
+                var line = "   запуск: \(c.locked ? "ЗАБЛОКИРОВАНО" : "разблокировано"), процессов: \(c.procs)"
+                if c.frozen > 0 { line += ", заморожено: \(c.frozen)" }
+                info(line, color: c.frozen > 0 ? .systemRed : nil)
             }
         } else {
             info("Нет данных от демона", bold: true, color: .systemOrange)

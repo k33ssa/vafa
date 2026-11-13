@@ -76,6 +76,7 @@ GEO_TTL=${GEO_TTL:-600}
 GEO_TTL_DOWN=${GEO_TTL_DOWN:-600}
 GEO_STALE=${GEO_STALE:-0}
 NOTIFY=0
+FREEZE_CLI=${FREEZE_CLI:-0}
 ${CONF_EXTRA:-}
 EOF
   chmod 600 $T/conf
@@ -90,7 +91,7 @@ start_daemon() {
   VPN_GUARD_IFACE_FILE=$T/iface VPN_GUARD_PFCTL=$FAKEPF FAKE_PF_DIR=$T/pf \
   VPN_GUARD_RESOLVER=${RESOLVER:-$T/resolver} \
   VPN_GUARD_NET_MONITOR=${MONITOR:-"tail -n0 -F $T/events"} \
-  VPN_GUARD_PROXY_CMD=${PROXY_CMD:-echo} \
+  VPN_GUARD_PROXY_CMD=${PROXY_CMD:-echo} VPN_GUARD_FREEZE_CLI=0 \
     zsh ./vpn-guard daemon >> $T/daemon.log 2>&1 &
   DPID=$!
   wait_status '"time"' 10 >/dev/null
@@ -645,7 +646,7 @@ VPN_GUARD_TEST=1 VPN_GUARD_CONF=$T/conf VPN_GUARD_STATE=$T/state \
   VPN_GUARD_APPS=$T/no-apps-file VPN_GUARD_COUNTRIES=$T/countries \
   VPN_GUARD_GEO_URLS="http://127.0.0.1:$HPORT/trace" VPN_GUARD_GEO_BIND=0 \
   VPN_GUARD_IFACE_FILE=$T/iface VPN_GUARD_PFCTL=$FAKEPF FAKE_PF_DIR=$T/pf \
-  VPN_GUARD_RESOLVER=$T/resolver VPN_GUARD_NET_MONITOR="tail -n0 -F $T/events" VPN_GUARD_PROXY_CMD=echo \
+  VPN_GUARD_RESOLVER=$T/resolver VPN_GUARD_NET_MONITOR="tail -n0 -F $T/events" VPN_GUARD_PROXY_CMD=echo VPN_GUARD_FREEZE_CLI=0 \
   zsh ./vpn-guard daemon >> $T/daemon.log 2>&1 &
 DPID=$!
 wait_status '"time"' 10 >/dev/null
@@ -714,6 +715,48 @@ INTERVAL=1 conf route geo; start_daemon
 check "страны не выбраны (проверить выход нечем) — прокси не засчитан" wait_status '"state":"down"' 5
 stop_daemon
 unset VPN_GUARD_PROXY_OWNER PROXY_CMD; countries RU CN BY IR; iface utun9; geo DE
+
+# ---- 47. Claude Code CLI: заморозка с потомками и запрет запуска (FREEZE_CLI) ---------
+# подделка CLI: голый бинарь «claude» (ad-hoc, id test.claude-code), он запускает дочерний
+# /bin/sleep — как агент запускает команды. Настоящую подпись CLI демон в тестах не трогает.
+print "47. Claude Code CLI: заморозка с дочерними процессами"
+mkdir -p $T/cli/bin
+print -r -- '#include <unistd.h>
+int main(void) { if (fork() == 0) { execl("/bin/sleep", "sleep", "1000", (char *)0); _exit(1); } for (;;) pause(); }' > $T/cli.c
+cc -o $T/cli/bin/claude $T/cli.c && codesign -s - -i test.claude-code --force $T/cli/bin/claude >/dev/null 2>&1
+$T/cli/bin/claude & CLI=$!; PIDS+=$CLI
+sleep 0.5
+CLIKID=$(pgrep -P $CLI sleep | head -1)
+check "подделка CLI запустила дочерний процесс" test -n "$CLIKID"
+pf_reset; geo RU
+CLIX="CLI_SIGS=( 'adhoc:test.claude-code:*' )
+CLI_GLOBS=( '$T/cli/bin/claude' )"
+FREEZE_CLI=1 CONF_EXTRA=$CLIX INTERVAL=1 conf route geo; start_daemon; vpn_is false 5; sleep 1.5
+check "VPN нет — CLI заморожен" test "$(pstate $CLI)" = T
+check "и его дочерний процесс тоже" test "$(pstate $CLIKID)" = T
+check "запуск CLI запрещён (+x снят)" eval '! test -x $T/cli/bin/claude'
+check "status.json: cli frozen" st '"cli":{"locked":true,"procs":1,"frozen":1}'
+geo DE; event CHANGE
+check "VPN вернулся" vpn_is true 5
+sleep 1.5
+check "CLI разморожен" test "$(pstate $CLI)" != T
+check "дочерний разморожен" test "$(pstate $CLIKID)" != T
+check "+x вернули" test -x $T/cli/bin/claude
+stop_daemon
+pf_reset; geo RU
+FREEZE_CLI=0 CONF_EXTRA=$CLIX INTERVAL=1 conf route geo; start_daemon; vpn_is false 5; sleep 1.5
+check "FREEZE_CLI=0 — CLI не тронут" test "$(pstate $CLI)" != T
+check "FREEZE_CLI=0 — +x на месте" test -x $T/cli/bin/claude
+check "status.json без cli" eval '! st "\"cli\":"'
+stop_daemon
+# настоящая подпись в тестах не трогается никогда (защита от заморозки живых сессий)
+pf_reset
+typeset -a REALCLI=( /opt/homebrew/lib/node_modules/@anthropic-ai/claude-code/bin/claude.exe(N.x)
+  ~/.npm-global/lib/node_modules/@anthropic-ai/claude-code/bin/claude.exe(N.x) )
+FREEZE_CLI=1 CONF_EXTRA="CLI_SIGS=( 'Q6L2SF6YDW:*' )" INTERVAL=1 conf route geo; start_daemon; vpn_is false 5; sleep 1.5
+check "VPN_GUARD_TEST: настоящая подпись CLI не ловится" st '"cli":{"locked":false,"procs":0,"frozen":0}'
+check "настоящие файлы claude по-прежнему исполняемые (${#REALCLI} шт.)" eval '( for f in $REALCLI[@]; do test -x $f || exit 1; done )'
+stop_daemon; kill -CONT $CLI $CLIKID 2>/dev/null; kill $CLIKID $CLI 2>/dev/null; geo DE
 
 print
 print "итог: прошло $PASS, упало $FAIL"

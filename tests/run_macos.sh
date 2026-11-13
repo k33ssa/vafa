@@ -628,6 +628,40 @@ CONF_EXTRA='APPS=()' INTERVAL=1 conf route geo; sleep 2.5
 check "убрали из списка — копия разморожена" test "$(pstate $COPY)" != T
 stop_daemon; kill -CONT $COPY $OTHER 2>/dev/null; kill $COPY $OTHER 2>/dev/null; geo DE
 
+# ---- 45. Cloudflare висит (туннель «завис») — круг не стоит, пропажа маршрута ловится сразу --
+# Раньше запрос страны был синхронным: curl --max-time 4 на каждый адрес, и всё это время
+# демон не видел ни событий, ни пропажи маршрута. Теперь опрос в фоне.
+print "45. страна спрашивается в фоне: зависший Cloudflare не держит круг"
+HPORT=$(( PORT + 1 ))
+python3 -c 'import socket,sys,time
+s=socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(("127.0.0.1", int(sys.argv[1]))); s.listen(50); c=[]
+while True: c.append(s.accept()[0])' $HPORT &
+PIDS+=$!; sleep 0.5
+pf_reset; iface utun9; INTERVAL=1 GEO_STALE=60 conf route geo
+rm -f $T/state/status.json
+VPN_GUARD_TEST=1 VPN_GUARD_CONF=$T/conf VPN_GUARD_STATE=$T/state \
+  VPN_GUARD_APPS=$T/no-apps-file VPN_GUARD_COUNTRIES=$T/countries \
+  VPN_GUARD_GEO_URLS="http://127.0.0.1:$HPORT/trace" VPN_GUARD_GEO_BIND=0 \
+  VPN_GUARD_IFACE_FILE=$T/iface VPN_GUARD_PFCTL=$FAKEPF FAKE_PF_DIR=$T/pf \
+  VPN_GUARD_RESOLVER=$T/resolver VPN_GUARD_NET_MONITOR="tail -n0 -F $T/events" \
+  zsh ./vpn-guard daemon >> $T/daemon.log 2>&1 &
+DPID=$!
+wait_status '"time"' 10 >/dev/null
+i=0; while (( i++ < 30 )) && ! pgrep -f "tail -n0 -F $T/events" >/dev/null; do sleep 0.1; done; sleep 0.2
+check "ответа нет — «не уверен», не «поднят» и не блокировка" wait_status '"state":"unsure"' 3
+c1=$(grep -o '"cycle":[0-9]*' $T/state/status.json | cut -d: -f2); sleep 2
+c2=$(grep -o '"cycle":[0-9]*' $T/state/status.json | cut -d: -f2)
+check "круг идёт, пока Cloudflare молчит (было $c1, стало $c2)" test $(( c2 - c1 )) -ge 1
+check "приложение не заморожено (страна не подтверждена)" test "$(fake_state)" != T
+t0=$EPOCHREALTIME; iface en0; event CHANGE
+wait_status '"state":"down"' 3 >/dev/null
+dt=$(( EPOCHREALTIME - t0 ))
+check "маршрут пропал — блокировка через $(printf %.1f $dt) с (раньше ждала curl до 4 с)" test $(( dt < 2.5 )) -eq 1
+sleep 0.3
+check "приложение заморожено" test "$(fake_state)" = T
+stop_daemon; iface utun9; geo DE
+
 print
 print "итог: прошло $PASS, упало $FAIL"
 (( FAIL == 0 ))

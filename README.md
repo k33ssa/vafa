@@ -10,19 +10,34 @@
 Щит: 🟢 VPN есть · 🟠 проверяю страну (сеть к Anthropic закрыта) или фильтр не работает ·
 🔴 блокировка · ⭕ пустой контур — охрана выключена.
 
+## Скачать
+
+| Система | Файл | Установка |
+|---|---|---|
+| macOS 12+ (Apple Silicon и Intel) | [Vafa-1.0.0.dmg](https://github.com/k33ssa/vafa/releases/download/v1.0.0/Vafa-1.0.0.dmg) | `brew install --cask k33ssa/tap/vafa` |
+| Windows 10/11 | [Vafa-1.0.0-windows.zip](https://github.com/k33ssa/vafa/releases/download/v1.0.0/Vafa-1.0.0-windows.zip) | распаковать, `install.cmd` |
+
+Все версии — на странице [Releases](https://github.com/k33ssa/vafa/releases).
+
 ---
 
 ##  macOS
 
 ### Установка
 
-Через Homebrew (обновление — `brew upgrade`):
-
 ```bash
 brew install --cask k33ssa/tap/vafa
 ```
 
-Или из исходников. Нужны Xcode Command Line Tools (один раз: `xcode-select --install`).
+Homebrew попросит пароль администратора: демон ставится от root.
+
+<details>
+<summary>Без Homebrew</summary>
+
+Скачать [Vafa-1.0.0.dmg](https://github.com/k33ssa/vafa/releases/download/v1.0.0/Vafa-1.0.0.dmg),
+открыть и в Терминале из открывшегося тома запустить `sudo ./install.sh`.
+
+Или собрать из исходников (нужны Xcode Command Line Tools: `xcode-select --install`):
 
 ```bash
 cd ~
@@ -31,6 +46,7 @@ cd vafa
 ./app/build.sh
 sudo ./install.sh
 ```
+</details>
 
 Щит сразу появится в строке меню. Если его нет: на macOS 26 — **Системные настройки →
 Строка меню → «Разрешить в строке меню» → Vafa** включить; при забитой строке меню значок
@@ -44,11 +60,10 @@ sudo vpn-guard status
 ### Обновление (если уже установлено)
 
 ```bash
-cd ~/vafa
-git pull
-./app/build.sh
-sudo ./install.sh
+brew upgrade --cask vafa
 ```
+
+Ставил из исходников — `cd ~/vafa && git pull && ./app/build.sh && sudo ./install.sh`.
 
 Обновляться лучше при включённом VPN — во время блокировки приложения заморожены.
 
@@ -87,6 +102,7 @@ sudo vpn-guard status      # что сейчас происходит
 sudo vpn-guard check       # только проверка VPN и страны
 sudo vpn-guard unlock      # аварийно снять всё (выключает охрану)
 sudo vpn-guard uninstall   # удалить демон
+brew uninstall --cask vafa # если ставил через Homebrew — удалит демон и Vafa.app
 ```
 
 `unlock` останавливает демон, снимает блокировку и сетевой блок — охрана выключена и после
@@ -100,8 +116,8 @@ sudo vpn-guard uninstall   # удалить демон
 
 ### Установка
 
-1. Скачать репозиторий: **Code → Download ZIP**, распаковать.
-2. Открыть папку `windows`, дважды щёлкнуть **`install.cmd`** → разрешить в окне UAC.
+1. Скачать [Vafa-1.0.0-windows.zip](https://github.com/k33ssa/vafa/releases/download/v1.0.0/Vafa-1.0.0-windows.zip), распаковать.
+2. В папке `Vafa-windows` дважды щёлкнуть **`install.cmd`** → разрешить в окне UAC.
 
 Щит появится в трее (в Windows 11 новые значки по умолчанию прячутся под стрелку **^** у
 часов). Чтобы он был виден всегда: **Параметры → Персонализация → Панель задач → Другие
@@ -111,9 +127,9 @@ sudo vpn-guard uninstall   # удалить демон
 
 ### Обновление (если уже установлено)
 
-1. Скачать свежий архив: **Code → Download ZIP** и распаковать (поверх старой папки или в новую —
-   неважно). Если репозиторий клонирован: `git pull`.
-2. В папке `windows` дважды щёлкнуть **`install.cmd`** → разрешить в окне UAC.
+1. Скачать свежий `Vafa-<версия>-windows.zip` со страницы [Releases](https://github.com/k33ssa/vafa/releases/latest)
+   и распаковать (поверх старой папки или в новую — неважно).
+2. В папке `Vafa-windows` дважды щёлкнуть **`install.cmd`** → разрешить в окне UAC.
 3. Дождаться «Установлено» и нажать любую клавишу.
 
 Лучше обновляться **при включённом VPN**: во время блокировки приложения заморожены.
@@ -194,7 +210,7 @@ sudo vpn-guard uninstall   # удалить демон
 охрана не вернётся сама. Включить снова: в трее «Охрана включена» или
 `Enable-ScheduledTask VPNGuard; Start-ScheduledTask VPNGuard`.
 
-Удалить: в распакованной папке `windows` —
+Удалить: в распакованной папке `Vafa-windows` —
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\uninstall.ps1

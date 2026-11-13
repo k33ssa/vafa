@@ -20,7 +20,7 @@ GitHub: `k33ssa/vafa`. Задачи — [TODO.md](TODO.md), журнал — `do
 | `vpn-guard` | macOS: демон (zsh, root, LaunchDaemon `local.vpnguard`). Подкоманды daemon/status/check/lock/unlock/uninstall |
 | `vpn-guard.conf` | настройки по умолчанию; ставится в `/usr/local/etc/` **только если там нет** — дальше install.sh лишь мигрирует известные старые значения |
 | `local.vpnguard.plist` | LaunchDaemon (`ProcessType=Interactive` — с Background круг шёл раз в 4 с) |
-| `install.sh`, `make-dmg.sh` | установка (sudo) и DMG |
+| `install.sh`, `make-dmg.sh` | установка (sudo) и DMG. Релизы на GitHub: `Vafa-<версия>.dmg` + `Vafa-<версия>-windows.zip` (папка `windows/` как есть); Homebrew — cask `vafa` в `k33ssa/homebrew-tap` (версию и sha256 править там при новом релизе) |
 | `app/main.swift`, `app/build.sh` | щит в строке меню; читает `/usr/local/var/vpn-guard/status.json` |
 | `windows/` | PowerShell-служба (задача Планировщика от SYSTEM), трей, install.cmd |
 | `tests/run_macos.sh`, `tests/fake-pfctl` | тесты демона без root и без интернета (~3 мин) |

@@ -2,6 +2,14 @@
 
 Нужно: macOS 12 или новее, Apple Silicon или Intel, пароль администратора.
 
+## Через Homebrew
+
+```bash
+brew install --cask k33ssa/tap/vafa
+```
+
+Обновление — `brew upgrade --cask vafa`, удаление — `brew uninstall --cask vafa`.
+
 ## С DMG (на другом Маке)
 
 1. Открыть `Vafa.dmg`.
@@ -40,14 +48,14 @@ sudo ./install.sh       # поставить всё
 
 ## Windows
 
-1. Скачать репозиторий (Code → Download ZIP) и распаковать.
-2. В папке `windows` дважды щёлкнуть **install.cmd** → разрешить в окне UAC.
+1. Скачать `Vafa-<версия>-windows.zip` со страницы [Releases](https://github.com/k33ssa/vafa/releases/latest) и распаковать.
+2. В папке `Vafa-windows` дважды щёлкнуть **install.cmd** → разрешить в окне UAC.
    Ставится служба (задача Планировщика от SYSTEM, стартует при загрузке),
    трей-приложение и ярлык «Vafa» в меню «Пуск».
 3. Щит в трее → двойной щелчок → отметить приложения → «Сохранить».
    В меню щита: «Охрана включена», «Запускать при входе в Windows», журнал.
 
-Удаление: PowerShell **от администратора**, в распакованной папке `windows`:
+Удаление: PowerShell **от администратора**, в распакованной папке `Vafa-windows`:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\uninstall.ps1

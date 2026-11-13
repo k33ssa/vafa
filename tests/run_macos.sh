@@ -587,6 +587,47 @@ check "без маршрута — VPN нет" vpn_is false 5
 check "в журнале нет «parameter not set»" eval '! grep -q "parameter not set" $T/daemon.log'
 stop_daemon; rm -f $T/iface.id; iface utun9
 
+# ---- 44. копия бандла в другой папке — ловится по подписи ------------------------------
+# Sig.app (ad-hoc, bundle id test.vafa.sig) в списке; её точная копия Copy.app — нет, но
+# морозится вместе с ней. Other.app — тот же бинарь, другой bundle id: не трогается.
+print "44. копия бандла ловится по подписи (MATCH_SIGNATURE)"
+mkbundle() {   # mkbundle <путь .app> <bundle id>
+  mkdir -p $1/Contents/MacOS
+  cp $T/Fake.app/Contents/MacOS/fake $1/Contents/MacOS/sig; chmod 755 $1/Contents/MacOS/sig
+  print -r -- "<?xml version=\"1.0\" encoding=\"UTF-8\"?><plist version=\"1.0\"><dict>
+<key>CFBundleIdentifier</key><string>$2</string><key>CFBundleExecutable</key><string>sig</string>
+<key>CFBundlePackageType</key><string>APPL</string></dict></plist>" > $1/Contents/Info.plist
+  codesign -s - -i $2 --force $1 >/dev/null 2>&1
+}
+mkbundle $T/Sig.app test.vafa.sig
+mkdir -p $T/elsewhere; cp -R $T/Sig.app $T/elsewhere/Copy.app
+mkbundle $T/Other.app test.vafa.other
+$T/elsewhere/Copy.app/Contents/MacOS/sig & COPY=$!; PIDS+=$COPY
+$T/Other.app/Contents/MacOS/sig & OTHER=$!; PIDS+=$OTHER
+sleep 0.5
+pstate() { ps -o state= -p $1 2>/dev/null | cut -c1 }
+pf_reset; geo RU
+CONF_EXTRA="APPS=( \"$T/Sig.app\" )" INTERVAL=1 conf route geo; start_daemon; vpn_is false 5; sleep 1.5
+check "копия в другой папке заморожена" test "$(pstate $COPY)" = T
+check "чужой бандл (другой bundle id) не тронут" test "$(pstate $OTHER)" != T
+check "в журнале — «ловлю её процессы по подписи»" grep -q "по подписи" $T/daemon.log
+geo DE; event CHANGE
+check "VPN вернулся" vpn_is true 5
+sleep 1.5
+check "копия разморожена" test "$(pstate $COPY)" != T
+stop_daemon
+pf_reset; geo RU
+CONF_EXTRA="APPS=( \"$T/Sig.app\" )
+MATCH_SIGNATURE=0" INTERVAL=1 conf route geo; start_daemon; vpn_is false 5; sleep 1.5
+check "MATCH_SIGNATURE=0 — копия не тронута" test "$(pstate $COPY)" != T
+stop_daemon
+# убрали из списка во время блокировки — копия тоже размораживается
+pf_reset; CONF_EXTRA="APPS=( \"$T/Sig.app\" )" INTERVAL=1 conf route geo; start_daemon; vpn_is false 5; sleep 1.5
+check "снова заморожена" test "$(pstate $COPY)" = T
+CONF_EXTRA='APPS=()' INTERVAL=1 conf route geo; sleep 2.5
+check "убрали из списка — копия разморожена" test "$(pstate $COPY)" != T
+stop_daemon; kill -CONT $COPY $OTHER 2>/dev/null; kill $COPY $OTHER 2>/dev/null; geo DE
+
 print
 print "итог: прошло $PASS, упало $FAIL"
 (( FAIL == 0 ))

@@ -48,6 +48,7 @@ VPN_REQUIRE=all      # all | any
 ON_DOWN=freeze       # freeze | kill
 LOCK_LAUNCH=1
 MATCH_ANY_PATH=0
+MATCH_SIGNATURE=1    # ловить копии бандла в другой папке по подписи (команда + bundle id)
 INTERVAL=1
 GRACE=0
 NOTIFY=1
@@ -172,7 +173,7 @@ validate_conf() {
   # 0/1: под set -u «LOCK_LAUNCH=yes» в (( )) — обращение к переменной yes, и блокировка
   # запуска молча выключалась
   local v d
-  for v d in LOCK_LAUNCH 1 NOTIFY 1 NET_WATCH 1 MATCH_ANY_PATH 0 GEO_BIND 1; do
+  for v d in LOCK_LAUNCH 1 NOTIFY 1 NET_WATCH 1 MATCH_ANY_PATH 0 MATCH_SIGNATURE 1 GEO_BIND 1; do
     [[ ${(P)v:-} == (0|1) ]] || { log "$v=${(P)v:-} — беру $d"; typeset -g $v=$d }
   done
   # одна кривая запись в таблице pf роняет загрузку всех правил — такие выкидываем;
@@ -511,9 +512,70 @@ app_exe_names() {
 # заморозки/разморозки PS_DIRTY=1 — status.json возьмёт свежий снимок.
 # ps -axww — самое дорогое в круге (~28 мс процессора), поэтому при устойчивом «VPN есть»
 # снимок раз в PS_EVERY с, а при блокировке и при смене состояния — каждый круг.
-typeset -g PS_SNAP='' PS_DIRTY=0 PS_T=0 PS_EVERY=5
+typeset -g PS_SNAP='' PS_DIRTY=0 PS_T=0 PS_EVERY=5 PS_GEN=0
 typeset -gA APC=()   # разбор снимка по приложениям — до следующего снимка
-ps_snap() { PS_SNAP=$(ps -axww -o pid=,stat=,comm= 2>/dev/null); PS_DIRTY=0 PS_T=$EPOCHSECONDS; APC=() }
+ps_snap() { PS_SNAP=$(ps -axww -o pid=,stat=,comm= 2>/dev/null); PS_DIRTY=0 PS_T=$EPOCHSECONDS; APC=(); (( ++PS_GEN )) }
+
+# ---- копии бандла: поиск по подписи (MATCH_SIGNATURE) ------------------------
+# Копию Claude.app в другой папке путь не ловит. Подпись у копии та же: команда
+# разработчика + bundle id (Q6L2SF6YDW:com.anthropic.claudefordesktop). Без команды
+# (ad-hoc, своя сборка) — bundle id + CDHash: ловится только точная копия. Подпись не
+# проверяется на целостность — испорченная копия всё равно называет себя так же.
+# Claude Code CLI (com.anthropic.claude-code) — другой bundle id, не ловится (решение
+# пользователя 2026-10-09). codesign — ~20 мс на бандл, только при первой встрече и при
+# смене Info.plist (inode+mtime через zstat); дальше — из кэша.
+typeset -gA SIGC=()   # корень бандла → «inode:mtime|подпись»
+typeset -gA SIGP=()   # подпись → строки «pid stat» копий из текущего снимка
+typeset -g SIG_GEN=-1
+
+# подпись бандла в REPLY; пусто — подписи нет или бандл не читается
+bundle_sig_r() {
+  local b=$1 k line id='' team='' cd=''
+  local -A h
+  REPLY=''
+  zstat -H h -- $b/Contents/Info.plist 2>/dev/null || return 1
+  k="${h[inode]}:${h[mtime]}"
+  if [[ -n ${SIGC[$b]:-} && ${SIGC[$b]%%|*} == $k ]]; then REPLY=${SIGC[$b]#*|}; return 0; fi
+  for line in ${(f)"$(codesign -dvvv -- $b 2>&1)"}; do
+    case $line in
+      Identifier=*) id=${line#*=} ;;
+      TeamIdentifier=*) team=${line#*=} ;;
+      CDHash=*) cd=${line#*=} ;;
+    esac
+  done
+  if [[ -n $id && -n $team && $team != 'not set' ]]; then REPLY="$team:$id"
+  elif [[ -n $id && -n $cd ]]; then REPLY="adhoc:$id:$cd"; fi
+  SIGC[$b]="$k|$REPLY"
+  return 0
+}
+
+# Один раз на снимок: процессы из бандлов вне списка, разложенные по подписи; app_procs_r
+# берёт оттуда процессы с подписью своего приложения. /System и /usr не смотрим.
+sig_scan() {
+  setopt local_options extended_glob
+  (( SIG_GEN == PS_GEN )) && return 0
+  SIG_GEN=$PS_GEN; SIGP=()
+  local a b line rest
+  local -a w
+  local -A want=() seen=()   # seen: бандл → подпись в этом снимке (у Claude.app ~30 процессов)
+  for a in $APPS[@]; do bundle_sig_r $a && [[ -n $REPLY ]] && want[$REPLY]=$a; done
+  # отбор строк с «.app/» — одним фильтром массива, а не проверкой в цикле
+  for line in ${(M)${(f)PS_SNAP}:#*.app/*}; do
+    w=( ${=line} )
+    (( ${#w} >= 3 )) || continue
+    rest=${line##[[:space:]]#[0-9]##[[:space:]]##[^[:space:]]##[[:space:]]##}
+    [[ $rest == /(System|usr)/* ]] && continue
+    b=${rest%%.app/*}.app
+    (( ${APPS[(Ie)$b]} )) && continue
+    if (( ${+seen[$b]} )); then REPLY=${seen[$b]}
+    else bundle_sig_r $b; seen[$b]=$REPLY; fi
+    [[ -n $REPLY ]] || continue
+    # все подписи, не только из списка: убранное из списка приложение тоже надо
+    # разморозить вместе с копиями (resume_app по старому списку)
+    SIGP[$REPLY]+="$w[1] $w[2]"$'\n'
+    [[ -n ${want[$REPLY]:-} ]] && warn_once "sigcopy:$b" "копия ${${want[$REPLY]}:t} в $b — ловлю её процессы по подписи"
+  done
+}
 
 # процессы приложения из снимка: строки «pid stat»
 # процессы приложения из снимка — в массив reply («pid stat»), без подоболочки и конвейера
@@ -534,6 +596,10 @@ app_procs_r() {
       reply+=( "$w[1] $w[2]" )
     fi
   done
+  if (( MATCH_SIGNATURE )); then
+    sig_scan
+    bundle_sig_r $app && [[ -n $REPLY && -n ${SIGP[$REPLY]:-} ]] && reply+=( ${(f)SIGP[$REPLY]} )
+  fi
   APC[$app]=${(F)reply}
 }
 

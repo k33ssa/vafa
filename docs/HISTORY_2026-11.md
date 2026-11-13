@@ -38,3 +38,13 @@ LuLu. Все режут сеть целиком; заморозки прилож
 **Трей Windows:** VM «Windows 11» нет в Parallels (`prlctl list -a` пуст) — живьём не проверено. По коду
 значок создаётся правильно (NotifyIcon, Visible, иконка), вероятная причина «не видно» — скрытие под ^ в
 Windows 11; README дополнен. Пользователь попросил: графикой работать только на внешнем мониторе.
+
+**Ещё шесть по просьбе пользователя** (агент, README и исходники на GitHub): LuLu (macOS, Network Extension
+content filter, процесс по audit token + подпись, XPC, при ошибке — allow), FreeSnitch (macOS, Swift: DNS-прокси
+с DoH + якорь pf + NetExt, root-демон через `SMAppService.daemon`, MIT), TaskExplorer (не файрвол — Endpoint
+Security), Portmaster (Windows WFP-драйвер / Linux nfqueue+eBPF, правила по стране и домену, Secure DNS), OpenSnitch
+(Linux, NFQUEUE, демон↔GUI через unix-сокет, `DefaultAction` без GUI — allow), Rethink (Android, локальный VPN,
+DoH/DoT/DNSCrypt). Условия «только через VPN и не из страны X» нет ни у одного; заморозки приложений — тоже.
+Полезные идеи — в TODO §1. Исходники Portmaster и сетевая часть TaskExplorer не прочитаны (404).
+По нашему коду (13.11): правила Windows Firewall ставятся в PersistentStore — переживают перезагрузку; IPv6
+Anthropic (`2607:6bc0::/32`) в `BLOCK_NETS` есть. Временную Windows-VM поставить нельзя: свободно 10,7 ГБ, нужно ~30.

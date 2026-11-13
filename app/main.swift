@@ -38,11 +38,22 @@ struct GuardStatus: Decodable {
     let net: String?         // "block" | "hold" (закрыто до проверки страны) | "via:utun5" | ""
     let net_ok: Bool?        // блокировка проверена и стоит на этом такте
     let net_error: String?
+    // nil/пусто — не режим прокси; иначе URL системного прокси VPN-клиента
+    let proxy: String?
 }
 
 enum Level { case up, unsure, down }
 
 extension GuardStatus {
+    // «маршрут: utun5» или, в режиме системного прокси, «через прокси 127.0.0.1:10809»
+    var routeLine: String {
+        if let p = proxy, !p.isEmpty {
+            let hp = p.components(separatedBy: "://").last ?? p
+            return "через прокси \(hp), страна: \(country.isEmpty ? "нет ответа" : country)"
+        }
+        return "маршрут: \(iface.isEmpty ? "—" : iface), страна: \(country.isEmpty ? "нет ответа" : country)"
+    }
+
     // Новый демон пишет state, старый — только vpn. Незнакомое значение — как «down»:
     // лучше лишний раз показать красный щит, чем зелёный.
     var level: Level {
@@ -297,7 +308,7 @@ struct StatusView: View {
                     .font(.title2.bold())
                     .foregroundColor(stale ? .orange : Color(nsColor: s.headlineColor))
                     .fixedSize(horizontal: false, vertical: true)
-                Text("маршрут: \(s.iface.isEmpty ? "—" : s.iface), страна: \(s.country.isEmpty ? "нет ответа" : s.country)")
+                Text(s.routeLine)
                     .foregroundColor(.secondary)
                 // у молчащего демона «сеть закрыта» уже не проверено — не показывать
                 if !stale, let n = s.netLine {
@@ -422,7 +433,7 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
             } else {
                 info(s.headline, bold: true, color: s.headlineColor)
             }
-            info("маршрут: \(s.iface.isEmpty ? "—" : s.iface), страна: \(s.country.isEmpty ? "нет ответа" : s.country)")
+            info(s.routeLine)
             // при выключенной охране или молчащем демоне это уже не проверено — не показывать
             if on && !isStale(s), let n = s.netLine { info(n.text, color: n.color) }
             if let cc = s.countries {

@@ -90,6 +90,7 @@ start_daemon() {
   VPN_GUARD_IFACE_FILE=$T/iface VPN_GUARD_PFCTL=$FAKEPF FAKE_PF_DIR=$T/pf \
   VPN_GUARD_RESOLVER=${RESOLVER:-$T/resolver} \
   VPN_GUARD_NET_MONITOR=${MONITOR:-"tail -n0 -F $T/events"} \
+  VPN_GUARD_PROXY_CMD=${PROXY_CMD:-echo} \
     zsh ./vpn-guard daemon >> $T/daemon.log 2>&1 &
   DPID=$!
   wait_status '"time"' 10 >/dev/null
@@ -644,7 +645,7 @@ VPN_GUARD_TEST=1 VPN_GUARD_CONF=$T/conf VPN_GUARD_STATE=$T/state \
   VPN_GUARD_APPS=$T/no-apps-file VPN_GUARD_COUNTRIES=$T/countries \
   VPN_GUARD_GEO_URLS="http://127.0.0.1:$HPORT/trace" VPN_GUARD_GEO_BIND=0 \
   VPN_GUARD_IFACE_FILE=$T/iface VPN_GUARD_PFCTL=$FAKEPF FAKE_PF_DIR=$T/pf \
-  VPN_GUARD_RESOLVER=$T/resolver VPN_GUARD_NET_MONITOR="tail -n0 -F $T/events" \
+  VPN_GUARD_RESOLVER=$T/resolver VPN_GUARD_NET_MONITOR="tail -n0 -F $T/events" VPN_GUARD_PROXY_CMD=echo \
   zsh ./vpn-guard daemon >> $T/daemon.log 2>&1 &
 DPID=$!
 wait_status '"time"' 10 >/dev/null
@@ -661,6 +662,58 @@ check "маршрут пропал — блокировка через $(printf 
 sleep 0.3
 check "приложение заморожено" test "$(fake_state)" = T
 stop_daemon; iface utun9; geo DE
+
+# ---- 46. VPN-клиент в режиме системного прокси (без туннеля) ----------------------------
+# маршрут на en0, системный прокси — 127.0.0.1:$PORT (тестовый HTTP умеет отдавать файл
+# по запросу через прокси: путь «http://127.0.0.1:PORT/trace» → www/http:/127.0.0.1:PORT/trace).
+# Напрямую «Cloudflare» говорит RU, через прокси — DE: так видно, что спросили через прокси.
+print "46. режим системного прокси"
+mkdir -p "$T/www/http:/127.0.0.1:$PORT"
+pgeo() { print -rl -- "fl=1" "loc=$1" > "$T/www/http:/127.0.0.1:$PORT/trace" }
+print -r -- "#!/bin/zsh
+print -r -- '<dictionary> {'
+print -r -- '  HTTPEnable : 0'
+print -r -- '  HTTPSEnable : 1'
+print -r -- '  HTTPSPort : $PORT'
+print -r -- '  HTTPSProxy : 127.0.0.1'
+print -r -- '  SOCKSEnable : 0'
+print -r -- '}'" > $T/scutil-proxy; chmod +x $T/scutil-proxy
+pf_reset; iface en0; geo RU; pgeo DE; countries RU
+PROXY_CMD=$T/scutil-proxy
+export VPN_GUARD_PROXY_OWNER=xray
+GEO_TTL=1 GEO_TTL_DOWN=1 INTERVAL=1 conf route geo; start_daemon
+check "прокси xray, через него DE — VPN засчитан" vpn_is true 5
+check "status.json: proxy = http://127.0.0.1:…" st "\"proxy\":\"http://127.0.0.1:$PORT\""
+check "сеть к Anthropic напрямую закрыта (block, без pass)" eval 'pf_has_block && ! pf_has_pass'
+check "приложение не заморожено" test "$(fake_state)" != T
+check "в журнале — «режиме системного прокси»" grep -q "режиме системного прокси" $T/daemon.log
+pgeo RU
+check "через прокси стал RU — блокировка" wait_status '"state":"down"' 5
+sleep 0.5; check "приложение заморожено" test "$(fake_state)" = T
+pgeo DE
+check "снова DE — VPN поднят" vpn_is true 5
+stop_daemon
+pf_reset
+export VPN_GUARD_PROXY_OWNER=Charles
+INTERVAL=1 conf route geo; start_daemon
+check "прокси держит не VPN-клиент (Charles) — VPN нет" wait_status '"state":"down"' 5
+check "в журнале — «нет в PROXY_APPS»" grep -q "нет в PROXY_APPS" $T/daemon.log
+stop_daemon
+pf_reset
+export VPN_GUARD_PROXY_OWNER=''
+INTERVAL=1 conf route geo; start_daemon
+check "VPN-клиент закрыт (порт никто не слушает) — VPN нет" wait_status '"state":"down"' 5
+stop_daemon
+pf_reset
+export VPN_GUARD_PROXY_OWNER=xray
+INTERVAL=1 CONF_EXTRA='PROXY_MODE=off' conf route geo; start_daemon
+check "PROXY_MODE=off — прокси не засчитывается" wait_status '"state":"down"' 5
+stop_daemon
+pf_reset; countries
+INTERVAL=1 conf route geo; start_daemon
+check "страны не выбраны (проверить выход нечем) — прокси не засчитан" wait_status '"state":"down"' 5
+stop_daemon
+unset VPN_GUARD_PROXY_OWNER PROXY_CMD; countries RU CN BY IR; iface utun9; geo DE
 
 print
 print "итог: прошло $PASS, упало $FAIL"

@@ -59,6 +59,11 @@ GEO_STALE=60         # сколько секунд «не уверен» (сет
 GEO_BIND=${VPN_GUARD_GEO_BIND:-1}   # спрашивать страну через сам туннель (curl --interface utunN)
 HOSTS_TTL=300        # как часто перерезолвить BLOCK_HOSTS, секунд
 HOSTS_MAX=256        # сколько адресов BLOCK_HOSTS держать в таблице (старые вытесняются)
+PROXY_MODE=auto      # auto — VPN-клиент в режиме системного прокси засчитывается (страна — через прокси); off — нет
+# процессы VPN-клиентов, которым верим как прокси (начало имени, без учёта регистра)
+typeset -ga PROXY_APPS=( xray sing-box v2ray clash mihomo hiddify happ nekobox nekoray v2box shadowrocket
+                         outline ss-local sslocal trojan hysteria tuic naive foxray streisand karing )
+PROXY_CMD=${VPN_GUARD_PROXY_CMD:-"scutil --proxy"}   # подменяется в tests/run_macos.sh
 NET_WATCH=1          # будить демон событиями сети (route -n monitor), а не только таймером
 PFCTL=${VPN_GUARD_PFCTL:-/sbin/pfctl}                 # подменяется в tests/run_macos.sh
 RESOLVER=${VPN_GUARD_RESOLVER:-"dscacheutil -q host -a name"}
@@ -171,6 +176,7 @@ validate_conf() {
   [[ $HOSTS_TTL == <30-86400> ]]  || { log "HOSTS_TTL=$HOSTS_TTL — беру 300"; HOSTS_TTL=300 }
   [[ $HOSTS_MAX == <1-4096> ]]    || { log "HOSTS_MAX=$HOSTS_MAX — беру 256"; HOSTS_MAX=256 }
   (( ${#VPN_CHECK} )) || { log "VPN_CHECK пуст — беру route"; VPN_CHECK=( route ) }
+  [[ $PROXY_MODE == (auto|off) ]] || { log "PROXY_MODE=$PROXY_MODE — беру auto"; PROXY_MODE=auto }
   # 0/1: под set -u «LOCK_LAUNCH=yes» в (( )) — обращение к переменной yes, и блокировка
   # запуска молча выключалась
   local v d
@@ -371,7 +377,67 @@ _is_tun() { [[ ${1:-} == (utun|ppp|ipsec|tun|tap)* ]] }
 # Интерфейс берётся один раз в начале круга (CUR_IF). Раньше vpn_up и выбор режима pf
 # спрашивали маршрут по отдельности с разницей в 1–3 с: vpn_up видел utun5, pf — уже en0,
 # и фильтр снимался совсем (режим open; в журнале 2026-09-25, 10-05, 10-06).
-_route_is_vpn() { _is_tun $CUR_IF }
+_route_is_vpn() { _is_tun $CUR_IF || [[ -n $VIA_PROXY ]] }
+
+# ---- VPN-клиент в режиме системного прокси (Happ/xray «Proxy», Clash, sing-box…) ----------
+# Туннеля нет, маршрут к Anthropic на en0, но приложения, которые слушают системный прокси
+# (Claude.app — Electron), ходят через локальный порт VPN-клиента. Засчитываем это как VPN,
+# только если: прокси на 127.0.0.1, порт слушает процесс из PROXY_APPS (а не Charles/
+# корпоративный фильтр), включена проверка страны и страна, спрошенная ЧЕРЕЗ ЭТОТ ПРОКСИ,
+# не из списка блокировки. pf при этом — block: напрямую к Anthropic нельзя никому (CLI
+# системный прокси не слушает — он просто не достучится), только через прокси.
+typeset -g VIA_PROXY='' PROXY_URL_C='' PROXY_OWNER='' PROXY_T=0
+
+# системный прокси (scutil --proxy) → URL для curl -x в REPLY; пусто — нет локального
+sys_proxy_r() {
+  local line k v
+  local -A p=()
+  REPLY=''
+  for line in ${(f)"$(${=PROXY_CMD} 2>/dev/null)"}; do
+    [[ $line == *' : '* ]] || continue
+    k=${${line%% : *}//[[:space:]]/}; v=${${line#* : }//[[:space:]]/}
+    p[$k]=$v
+  done
+  if [[ ${p[SOCKSEnable]:-0} == 1 && ${p[SOCKSProxy]:-} == (127.0.0.1|localhost) && ${p[SOCKSPort]:-} == <1-65535> ]]; then
+    REPLY="socks5h://127.0.0.1:${p[SOCKSPort]}"
+  elif [[ ${p[HTTPSEnable]:-0} == 1 && ${p[HTTPSProxy]:-} == (127.0.0.1|localhost) && ${p[HTTPSPort]:-} == <1-65535> ]]; then
+    REPLY="http://127.0.0.1:${p[HTTPSPort]}"
+  fi
+  return 0
+}
+
+# кто слушает порт (имя процесса) → REPLY. VPN_GUARD_PROXY_OWNER — для тестов
+proxy_owner_r() {
+  local l
+  REPLY=''
+  if [[ -n ${VPN_GUARD_PROXY_OWNER+x} ]]; then REPLY=$VPN_GUARD_PROXY_OWNER; return 0; fi
+  for l in ${(f)"$(lsof -nP -iTCP:$1 -sTCP:LISTEN -Fc 2>/dev/null)"}; do
+    [[ $l == c* ]] && { REPLY=${l#c}; return 0 }
+  done
+  return 0
+}
+
+# раз в круг, когда маршрут не через туннель: VIA_PROXY — URL прокси или пусто.
+# scutil — каждый круг (~3 мс), lsof — при смене прокси и раз в 10 с.
+proxy_check() {
+  local url o a
+  VIA_PROXY=''
+  [[ $PROXY_MODE == auto ]] || return 0
+  geo_active || return 0   # страну проверить нечем — выход через прокси не подтвердить
+  sys_proxy_r; url=$REPLY
+  [[ -n $url ]] || { PROXY_URL_C=''; return 0 }
+  if [[ $url != $PROXY_URL_C ]] || (( EPOCHSECONDS - PROXY_T >= 10 || EPOCHSECONDS < PROXY_T )); then
+    proxy_owner_r ${url##*:}
+    PROXY_URL_C=$url PROXY_OWNER=$REPLY PROXY_T=$EPOCHSECONDS
+  fi
+  o=${(L)PROXY_OWNER}
+  [[ -n $o ]] || return 0   # порт никто не слушает — VPN-клиент закрыт, прокси остался в настройках
+  for a in $PROXY_APPS[@]; do
+    [[ $o == ${(L)a}* ]] && { VIA_PROXY=$url; return 0 }
+  done
+  warn_once "proxyown:$PROXY_OWNER:$url" "системный прокси $url держит «$PROXY_OWNER» — его нет в PROXY_APPS, VPN не засчитываю"
+  return 0
+}
 
 _nc_connected() {
   local want=$1
@@ -409,7 +475,8 @@ typeset -ga GEO_URLS=( https://1.1.1.1/cdn-cgi/trace https://1.0.0.1/cdn-cgi/tra
 _geo_fetch() {
   local -a opt=( -s --max-time 4 )
   local out l
-  [[ -n ${2:-} ]] && opt+=( --interface $2 )
+  if [[ ${2:-} == proxy:* ]]; then opt+=( -x ${2#proxy:} )   # через прокси VPN-клиента
+  elif [[ -n ${2:-} ]]; then opt+=( --interface $2 ); fi
   REPLY=''
   out=$(curl $opt $1 2>/dev/null)
   for l in ${(f)out}; do
@@ -475,6 +542,8 @@ _geo_collect() {
 _geo_refresh() {
   local i=$CUR_IF cc='' ttl=$GEO_TTL bind='' d f
   (( GUARD_DOWN )) && ttl=$GEO_TTL_DOWN
+  # режим прокси: свой «интерфейс» для кэша страны — смена прокси сбрасывает прошлый ответ
+  [[ -n $VIA_PROXY ]] && i="proxy:$VIA_PROXY"
   if (( GEO_ASYNC && GEO_JOB_PID )); then
     if [[ $GEO_JOB_IF == $i ]] && _geo_collect $i; then :   # дальше: не пора ли спросить снова
     elif (( GEO_JOB_PID == 0 )); then :   # ответ был про другой интерфейс — спросить заново
@@ -490,7 +559,8 @@ _geo_refresh() {
   (( d < 0 || d >= ttl )) || [[ $i != $GEO_LAST_IF ]] || return 0
   # не через туннель — не спрашивать вовсе: запрос ушёл бы с настоящего адреса,
   # а ответ и так известен (VPN нет)
-  if (( GEO_BIND )); then _is_tun $i && bind=$i; fi
+  if [[ $i == proxy:* ]]; then bind=$i
+  elif (( GEO_BIND )); then _is_tun $i && bind=$i; fi
   if (( GEO_BIND )) && [[ -z $bind ]]; then _geo_apply $i ''; return 0; fi
   if (( GEO_ASYNC )); then
     (( ++GEO_JOB_N ))
@@ -1009,7 +1079,11 @@ pf_mode_when_up() {
   if _is_tun $CUR_IF; then
     REPLY="via:$CUR_IF"
   else
-    log_every notun 600 "VPN признан поднятым, но маршрут не через туннель ($CUR_IF) — напрямую к Anthropic нельзя, только через прокси"
+    if [[ -n $VIA_PROXY ]]; then
+      log_every notun 600 "VPN в режиме системного прокси ($VIA_PROXY, $PROXY_OWNER) — напрямую к Anthropic нельзя, только через прокси"
+    else
+      log_every notun 600 "VPN признан поднятым, но маршрут не через туннель ($CUR_IF) — напрямую к Anthropic нельзя, только через прокси"
+    fi
     REPLY=block
   fi
 }
@@ -1131,6 +1205,7 @@ write_status() {
   (( PS_DIRTY )) && ps_snap
   json_str $state;        out="{\"time\":$EPOCHSECONDS,\"cycle\":$CYCLE_N,\"state\":$REPLY,\"vpn\":$vpn,"
   json_str "$CUR_IF";     out+="\"iface\":$REPLY,"
+  json_str "$VIA_PROXY";  out+="\"proxy\":$REPLY,"
   json_str "$net";        out+="\"net\":$REPLY,\"net_ok\":$ok,"
   json_str "$PF_ERR";     out+="\"net_error\":$REPLY,"
   json_str "$GEO_LAST_CC"; out+="\"country\":$REPLY,"
@@ -1326,6 +1401,7 @@ cmd_daemon() {
   chmod 755 $STATE_DIR   # status.json должен читаться без sudo; perms/ остаётся 700
   load_conf
   CUR_IF=$(_default_iface)
+  _is_tun $CUR_IF || proxy_check
   hosts_load
   # закрыто, пока не доказано обратное: после перезагрузки якорь пуст, а первая
   # проверка страны может идти секунды (2026-10-03 — 5 минут без правил)
@@ -1364,6 +1440,7 @@ cmd_daemon() {
     CYCLE_T0=$EPOCHREALTIME
     (( CYCLE_N++ ))
     default_iface_r; CUR_IF=$REPLY   # один снимок на круг — им пользуются и проверка, и pf
+    if _is_tun $CUR_IF; then VIA_PROXY=''; else proxy_check; fi
     # VPN мог переподключиться (тот же utunN, неизвестный сервер): соединения, открытые
     # через старый туннель, оборвать, пока страна не перепроверена. Только если событие
     # про сам туннель (IFINFO с его номером) или у туннеля сменился «паспорт» (имя, номер,
@@ -1442,6 +1519,7 @@ cmd_daemon() {
 cmd_check() {
   load_conf >/dev/null 2>&1
   CUR_IF=$(_default_iface)
+  _is_tun $CUR_IF || proxy_check
   local rule
   for rule in $VPN_CHECK[@]; do
     local note=''
@@ -1465,6 +1543,7 @@ cmd_check() {
 cmd_status() {
   load_conf >/dev/null 2>&1
   CUR_IF=$(_default_iface)
+  _is_tun $CUR_IF || proxy_check
   print -r -- "default route -> $CUR_IF"
   cmd_check
   # IPv6 мимо туннеля pf и так режет; страну по v6 здесь не спрашиваем: такой запрос сам

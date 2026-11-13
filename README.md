@@ -2,6 +2,8 @@
 
 # Vafa (Verify access for apps) 
 
+**[English version below](#english)**
+
 Не даёт пользоваться выбранными приложениями, пока не включён VPN.
 Без VPN приложения **замораживаются** и **не запускаются**; когда VPN
 возвращается — всё размораживается само. Значок-щит показывает статус
@@ -30,6 +32,13 @@ brew install --cask k33ssa/tap/vafa
 ```
 
 Homebrew попросит пароль администратора: демон ставится от root.
+
+**Автообновление.** `brew upgrade` подтягивает новые версии. Чтобы Homebrew обновлял всё сам в фоне
+(раз в сутки), один раз выполнить:
+
+```bash
+brew tap homebrew/autoupdate && brew autoupdate start --upgrade --cleanup
+```
 
 <details>
 <summary>Без Homebrew</summary>
@@ -265,3 +274,58 @@ powershell -ExecutionPolicy Bypass -File .\uninstall.ps1
 | `windows/` | Windows: служба, трей, `install.cmd`, `uninstall.ps1` |
 | `INSTALL.md` | подробная установка для обеих систем |
 | `tests/` | тесты: `run_macos.sh` (без root и интернета), `run_windows.ps1` (в VM от администратора) |
+
+---
+
+<a id="english"></a>
+
+## English
+
+**Vafa (Verify access for apps)** is a free, open-source VPN kill switch for macOS and Windows. It keeps chosen apps (Claude, VLC, anything you pick) frozen and unable to launch, and blocks their network, until a VPN with an allowed exit country is up. When the VPN comes back, everything unfreezes on its own. A shield in the menu bar or system tray shows the status; click it to pick apps and blocked countries.
+
+Shield: green — VPN is up · orange — checking the exit country (network to the protected hosts is closed) or the filter is broken · red — blocked · empty outline — protection is off.
+
+### Download
+
+| Platform | File | Install |
+|---|---|---|
+| macOS 12+ (Apple Silicon and Intel) | [Vafa-1.0.0.dmg](https://github.com/k33ssa/vafa/releases/download/v1.0.0/Vafa-1.0.0.dmg) | `brew install --cask k33ssa/tap/vafa` |
+| Windows 10/11 | [Vafa-1.0.0-windows.zip](https://github.com/k33ssa/vafa/releases/download/v1.0.0/Vafa-1.0.0-windows.zip) | unzip, run `install.cmd` |
+
+All versions: [Releases](https://github.com/k33ssa/vafa/releases).
+
+### macOS
+
+```bash
+brew install --cask k33ssa/tap/vafa
+```
+
+Homebrew asks for the admin password because the daemon runs as root. Without Homebrew: open the DMG and run `sudo ./install.sh` from the mounted volume.
+
+- Update: `brew upgrade --cask vafa`
+- Automatic background updates: `brew tap homebrew/autoupdate && brew autoupdate start --upgrade --cleanup`
+- Status: `sudo vpn-guard status`
+- Uninstall: `brew uninstall --cask vafa`
+
+If the shield does not appear on macOS 26, enable Vafa in System Settings -> Menu Bar -> Allow in the Menu Bar.
+
+### Windows
+
+1. Download [Vafa-1.0.0-windows.zip](https://github.com/k33ssa/vafa/releases/download/v1.0.0/Vafa-1.0.0-windows.zip) and unzip it.
+2. In `Vafa-windows`, double-click `install.cmd` and accept the UAC prompt.
+
+The shield appears in the tray (on Windows 11 it may hide under the ^ arrow); double-click it to choose apps. To update, download the newer zip and run `install.cmd` again: your settings and app list are kept. To uninstall, run `powershell -ExecutionPolicy Bypass -File .\uninstall.ps1` from an admin PowerShell in that folder.
+
+### How it works
+
+A system service (root daemon on macOS, a SYSTEM scheduled task on Windows) checks the VPN every second and immediately on any network change. The VPN counts only when internet traffic goes through a tunnel adapter and Cloudflare, asked through that tunnel, sees an exit outside the blocked countries (Russia, China, Belarus and Iran by default; change them in the shield). Without a valid VPN it:
+
+- blocks network access to the protected hosts first (pf on macOS, Windows Firewall rule `VPNGuard-Block` on Windows; Anthropic networks and telemetry by default);
+- freezes the chosen apps (or quits them with `ON_DOWN=kill`);
+- prevents them from launching.
+
+The network to the protected hosts is closed by default: at startup, while the exit country is being re-checked after a network event, and until a fresh answer confirms it. The firewall rules are verified every second and repaired if something removes them. The country check never goes out through your real address.
+
+Any tunnel-mode VPN works: WireGuard, OpenVPN, Outline, AmneziaVPN, Happ, built-in IKEv2 and others. On macOS a system-proxy VPN (xray, sing-box, Clash on 127.0.0.1) is also accepted. Split tunneling that sends the protected hosts outside the tunnel counts as no VPN.
+
+Config: `/usr/local/etc/vpn-guard.conf` (macOS), `C:\ProgramData\VPNGuard\config.json` (Windows). Detailed notes (Russian): [docs/ПОДРОБНО.md](docs/ПОДРОБНО.md).

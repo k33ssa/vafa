@@ -588,4 +588,8 @@ let app = NSApplication.shared
 let controller = Controller()
 app.delegate = controller
 app.setActivationPolicy(.accessory)   // только значок в строке меню, без Dock
-app.run()
+// Запуск только через NSApplicationMain, не app.run(): на macOS 26 система в обход
+// NSApplicationMain может не связать процесс с bundle id — значка нет в строке меню и
+// приложения нет в «Настройки → Строка меню → Разрешить в строке меню» (Apple DTS,
+// developer.apple.com/forums/thread/794920). Делегат, заданный выше, сохраняется.
+_ = NSApplicationMain(CommandLine.argc, CommandLine.unsafeArgv)

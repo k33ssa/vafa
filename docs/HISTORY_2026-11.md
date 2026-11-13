@@ -22,3 +22,19 @@
 
 Файлы: `vpn-guard`, `tests/run_macos.sh`, `CLAUDE.md`, `TODO.md`, `docs/ПОДРОБНО.md`,
 `docs/HISTORY_2026-11.md` (новый).
+
+## 2026-11-13 — аналоги, щит на macOS 26, трей Windows
+
+**Аналоги** (агент, веб): Mullvad (pf-якорь / WFP, атомарная смена правил, выборочный сброс состояний,
+persistent и boot-time фильтры WFP, блок DNS вне туннеля), AirVPN Eddie (Network Lock: pf/WFP/nftables),
+Proton и Windscribe («постоянный» kill switch, переживает перезагрузку), скрипты pf killswitch, simplewall (WFP),
+LuLu. Все режут сеть целиком; заморозки приложений ни у кого нет — у Vafa это своё. Что стоит проверить у нас —
+в TODO §1 (окно при загрузке Windows, DNS; IPv6 у нас уже закрыт). Исходники Proton/IVPN и Windows-часть Mullvad агент не прочитал.
+
+**Щит macOS 26:** Apple DTS (developer.apple.com/forums/thread/794920) — в обход `NSApplicationMain` система не
+связывает процесс с bundle id → значка нет. У нас было `app.run()` → заменено на `NSApplicationMain`. На 15.5
+тестовая сборка щит показывает; на 26 не проверено. В README — выключатель «Разрешить в строке меню».
+
+**Трей Windows:** VM «Windows 11» нет в Parallels (`prlctl list -a` пуст) — живьём не проверено. По коду
+значок создаётся правильно (NotifyIcon, Visible, иконка), вероятная причина «не видно» — скрытие под ^ в
+Windows 11; README дополнен. Пользователь попросил: графикой работать только на внешнем мониторе.

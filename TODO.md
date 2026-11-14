@@ -15,12 +15,16 @@
 * [ ] Пересобрать и поставить щит с новой точкой входа (`NSApplicationMain`): `./app/build.sh && sudo ./install.sh`;
   на Маке с macOS 26 проверить, что щит виден и Vafa есть в «Настройки → Строка меню → Разрешить в строке
   меню». На 15.5 проверено 13.11 (тестовая сборка из scratchpad, щит появился), на 26 — нечем.
-* [ ] Windows-VM (добро пользователя 14.11) — **в работе**: образ `Windows11_arm64_ru.iso` (8,5 ГБ, microsoft.com,
-  русская, сборка 26300) качается сразу на SSD `/Volumes/KINGSTON/vafa-winvm/`; там же растущий диск APFS
-  `VafaWinVM.sparsebundle` (до 120 ГБ; SSD — exFAT, Parallels на нём держать нельзя), смонтирован как
-  `/Volumes/VafaWinVM`, в нём VM «Vafa Win11» (TPM, 4 CPU, 4 ГБ, сеть shared → через VPN Мака). Дальше: поставить
-  Windows (внешний монитор), Vafa 1.0.2, проверить трей и перезагрузку без VPN, потом удалить VM, образ и
-  sparsebundle. Если сессия оборвётся: `prlctl list -a`, `hdiutil attach …/VafaWinVM.sparsebundle`.
+* [ ] Windows-VM (добро пользователя 14.11) — **на паузе 14.11 13:25 (пользователь уехал)**. Сделано: образ
+  `Windows11_arm64_ru.iso` на SSD `/Volumes/KINGSTON/vafa-winvm/` (SHA-256 сверен с microsoft.com); диск APFS
+  `VafaWinVM.sparsebundle` там же (SSD — exFAT); VM «Vafa Win11» (Pro, русская, локальный пользователь `vafa` без
+  пароля, приватность — всё выключено) установлена, приостановлена (`suspended`), диск отключён. Запущена установка
+  Parallels Tools (`prlctl installtools`) — проверить, дошла ли. **Продолжить:** подключить SSD →
+  `hdiutil attach -nobrowse /Volumes/KINGSTON/vafa-winvm/VafaWinVM.sparsebundle` → `prlctl resume "Vafa Win11"` →
+  Tools (если нет — согласиться в окне установщика) → в VM скачать Vafa-1.0.2-windows.zip с GitHub, install.cmd от
+  администратора → трей виден? → перезагрузка без VPN: правило брандмауэра стоит с самого старта? → удалить VM,
+  образ, sparsebundle. Ввод без экрана: `prlctl send-key-event … --json` пачкой (отдельные вызовы «залипают»),
+  снимок экрана гостя: `prlctl capture`. Помощники были в scratchpad сессии (vmtype.py, vmkeys.py) — пропадут.
 * [ ] Предложено, ждёт решения: запись конца «жёлтого» с длительностью в журнал; проверка страны по пути до
   Anthropic раз в минуту (см. ниже).
 * [ ] Happ запущен прямо с образа диска (`/Volumes/Happ v4.5.4 1/`) — перенести в «Программы».

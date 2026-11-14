@@ -24,11 +24,12 @@ zmodload -F zsh/stat b:zstat   # только zstat: встроенный stat �
 zmodload -F zsh/files b:zf_chmod b:zf_mv   # для status.json каждый круг — без отдельных процессов
 setopt no_nomatch
 set -u
+SELF=${0:A}   # путь к этому скрипту (внутри функций $0 — имя функции)
 
 CONF=${VPN_GUARD_CONF:-/usr/local/etc/vpn-guard.conf}
 STATE_DIR=${VPN_GUARD_STATE:-/usr/local/var/vpn-guard}
 PERM_DIR=$STATE_DIR/perms
-PLIST=/Library/LaunchDaemons/local.vpnguard.plist
+PLIST=${VPN_GUARD_PLIST:-/Library/LaunchDaemons/local.vpnguard.plist}   # подменяется в tests/run_macos.sh
 
 # ---- значения по умолчанию (перекрываются конфигом) -------------------------
 typeset -ga APPS=()
@@ -1797,6 +1798,51 @@ cmd_uninstall() {
   print -r -- "Остались (удали вручную, если не нужны): /usr/local/bin/vpn-guard, $CONF"
 }
 
+# ---- удаление при обновлении через Homebrew ------------------------------------
+# `brew upgrade` сначала выполняет раздел uninstall СТАРОЙ формулы, потом ставит новую.
+# Прежний `vpn-guard uninstall` сразу снимал всё (разморозка, +x, pf) — до установки новой
+# версии защиты не было (секунды, а пока Homebrew ждёт пароль — дольше). Теперь формула
+# зовёт uninstall-deferred: демон остановлен (при остановке он оставляет сеть закрытой,
+# приложения — замороженными), а снять защиту решает отдельный процесс через
+# UNINSTALL_WAIT секунд: поставилась новая версия (демон снова загружен) — это было
+# обновление, ничего не трогаем; нет — настоящее удаление, снимаем всё.
+UNINSTALL_WAIT=${VPN_GUARD_UNINSTALL_WAIT:-120}
+UNINSTALL_LOG=${VPN_GUARD_LOG:-/usr/local/var/log/vpn-guard.log}
+
+daemon_loaded() {
+  if [[ ${VPN_GUARD_TEST:-} == 1 ]]; then [[ -e $STATE_DIR/test.loaded ]]; return; fi
+  launchctl print system/local.vpnguard >/dev/null 2>&1
+}
+
+cmd_uninstall_deferred() {
+  need_root
+  local tmp
+  [[ ${VPN_GUARD_TEST:-} == 1 ]] || launchctl bootout system $PLIST 2>/dev/null
+  # сам скрипт при обновлении перепишут — ждать будет его копия
+  tmp=$(mktemp /tmp/vafa-uninstall.XXXXXX) || { cmd_uninstall; return }
+  cp -f -- $SELF $tmp && chmod 700 $tmp || { rm -f $tmp; cmd_uninstall; return }
+  nohup zsh $tmp uninstall-finish $tmp </dev/null >>$UNINSTALL_LOG 2>&1 &!
+  print -r -- "Демон остановлен. Если это обновление — новая версия подхватит защиту."
+  print -r -- "Если удаление — через $UNINSTALL_WAIT с блокировка снимется сама (сразу: sudo vpn-guard unlock)."
+}
+
+cmd_uninstall_finish() {
+  need_root
+  local self=${1:-} t0=$EPOCHSECONDS
+  while (( EPOCHSECONDS - t0 < UNINSTALL_WAIT )); do
+    if daemon_loaded; then
+      log "удаление: новая версия запущена — это было обновление, защиту не снимаю"
+      [[ -n $self ]] && rm -f -- $self
+      return 0
+    fi
+    sleep 2
+  done
+  log "удаление: за $UNINSTALL_WAIT с новая версия не появилась — снимаю защиту"
+  cmd_uninstall >/dev/null 2>&1
+  [[ -n $self ]] && rm -f -- $self
+  return 0
+}
+
 case ${1:-status} in
   (daemon)    cmd_daemon ;;
   (status)    cmd_status ;;
@@ -1804,5 +1850,7 @@ case ${1:-status} in
   (lock)      cmd_lock ;;
   (unlock)    cmd_unlock ;;
   (uninstall) cmd_uninstall ;;
-  (*) die "использование: vpn-guard {daemon|status|check|lock|unlock|uninstall}" ;;
+  (uninstall-deferred) cmd_uninstall_deferred ;;
+  (uninstall-finish)   cmd_uninstall_finish ${2:-} ;;
+  (*) die "использование: vpn-guard {daemon|status|check|lock|unlock|uninstall|uninstall-deferred}" ;;
 esac

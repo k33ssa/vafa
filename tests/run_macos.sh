@@ -758,6 +758,41 @@ check "VPN_GUARD_TEST: настоящая подпись CLI не ловится
 check "настоящие файлы claude по-прежнему исполняемые (${#REALCLI} шт.)" eval '( for f in $REALCLI[@]; do test -x $f || exit 1; done )'
 stop_daemon; kill -CONT $CLI $CLIKID 2>/dev/null; kill $CLIKID $CLI 2>/dev/null; geo DE
 
+# ---- 48. удаление при обновлении через Homebrew: защита не снимается ---------------------
+# brew upgrade выполняет uninstall старой формулы до установки новой. uninstall-deferred:
+# демон остановлен (сеть закрыта, приложение заморожено), а снимает защиту отдельный процесс,
+# только если за UNINSTALL_WAIT новая версия не загрузилась.
+print "48. отложенное удаление (обновление через Homebrew)"
+udef() {
+  VPN_GUARD_TEST=1 VPN_GUARD_CONF=$T/conf VPN_GUARD_STATE=$T/state VPN_GUARD_APPS=$T/no-apps-file \
+  VPN_GUARD_COUNTRIES=$T/countries VPN_GUARD_IFACE_FILE=$T/iface VPN_GUARD_PFCTL=$FAKEPF FAKE_PF_DIR=$T/pf \
+  VPN_GUARD_PLIST=$T/plist VPN_GUARD_UNINSTALL_WAIT=4 VPN_GUARD_LOG=$T/uninst.log VPN_GUARD_FREEZE_CLI=0 \
+    zsh ./vpn-guard uninstall-deferred > $T/udef.out 2>&1
+}
+pf_reset; touch $T/plist; rm -f $T/state/test.loaded
+INTERVAL=1 conf route geo; geo RU; start_daemon; vpn_is false 5; sleep 1
+kill $DPID 2>/dev/null; wait $DPID 2>/dev/null; DPID=''   # как launchctl bootout: без разморозки
+check "демон остановлен — приложение по-прежнему заморожено" test "$(fake_state)" = T
+udef
+sleep 1; touch $T/state/test.loaded                         # «новая версия загрузилась»
+sleep 5
+check "обновление: приложение заморожено" test "$(fake_state)" = T
+check "обновление: запуск запрещён (+x снят)" eval '! test -x $T/Fake.app/Contents/MacOS/fake'
+check "обновление: сеть к Anthropic закрыта" pf_has_block
+check "обновление: в журнале «это было обновление»" grep -q "это было обновление" $T/uninst.log
+rm -f $T/state/test.loaded
+udef
+check "удаление: сразу после команды защита ещё стоит" eval 'test "$(fake_state)" = T && pf_has_block'
+t0=$EPOCHREALTIME; while (( EPOCHREALTIME - t0 < 25 )) && { test -e $T/plist || ls /tmp/vafa-uninstall.* >/dev/null 2>&1 }; do sleep 0.5; done
+sleep 0.5
+check "удаление: через UNINSTALL_WAIT приложение разморожено" test "$(fake_state)" != T
+check "удаление: +x вернули" test -x $T/Fake.app/Contents/MacOS/fake
+check "удаление: правила pf сняты" test ! -e $T/pf/anchor.rules
+check "удаление: plist убран" test ! -e $T/plist
+check "удаление: в журнале «снимаю защиту»" grep -q "снимаю защиту" $T/uninst.log
+check "копия скрипта в /tmp убрана" eval '! ls /tmp/vafa-uninstall.* >/dev/null 2>&1'
+geo DE; mkdir -p $T/state
+
 print
 print "итог: прошло $PASS, упало $FAIL"
 (( FAIL == 0 ))

@@ -1,4 +1,4 @@
-<p align="center"><img src="assets/logo.png" width="280" alt="Vafa"></p>
+<p align="center"><img src="assets/icon-1024.png" width="240" alt="Vafa"></p>
 
 # Vafa (Verify access for apps) 
 

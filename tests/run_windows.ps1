@@ -15,13 +15,21 @@
 #   powershell -ExecutionPolicy Bypass -File tests\run_windows.ps1             # демон, минуты 3-4
 #   powershell -ExecutionPolicy Bypass -File tests\run_windows.ps1 -Install    # плюс install.ps1 / uninstall.ps1
 # Меняет на время теста: профиль брандмауэра Public (выключает на секунды, исключает из
-# защиты KM-TEST и возвращает как было), лишний адрес 10.254.254.254/32 на основном адаптере,
+# защиты KM-TEST и возвращает как было), лишний IPv6-адрес fd00:254::254/128 на основном адаптере,
 # KM-TEST Loopback (с новым именем «Vafa Test* [1]»), время в
 # виртуалке (на 10 минут назад и обратно).
 param([switch]$Install, [switch]$NoLoopback)
 
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
+$dhcpWas = $null
+# вернуть DHCP на основном адаптере, если тест его выключил (см. раздел 11)
+function Restore-Dhcp {
+    if ("$script:dhcpWas" -ne 'Enabled' -or -not $script:egress) { return }
+    if ((Get-NetIPInterface -InterfaceAlias $script:egress -AddressFamily IPv4).Dhcp -eq 'Enabled') { return }
+    Set-NetIPInterface -InterfaceAlias $script:egress -AddressFamily IPv4 -Dhcp Enabled -ErrorAction SilentlyContinue
+    & ipconfig.exe /renew $script:egress | Out-Null
+}
 [Console]::OutputEncoding = [Text.Encoding]::UTF8
 Remove-TypeData System.Array -ErrorAction SilentlyContinue
 $Repo  = Split-Path $PSScriptRoot -Parent
@@ -694,7 +702,13 @@ try {
     Geo 'DELAY 3 DE'
     [void](WaitFor { (St).state -eq 'up' } 15)
     Start-Sleep 2
-    New-NetIPAddress -InterfaceAlias $egress -IPAddress 10.254.254.254 -PrefixLength 32 -SkipAsSource $true | Out-Null
+    # статический адрес на адаптере с DHCP выключает DHCP, и после удаления адреса VM остаётся
+    # без сети (адрес 169.254.x, нет маршрута по умолчанию) — разделы 11–15 падали не из-за
+    # Vafa (VM Parallels с DHCP, 2026-11-14). Запомнить и вернуть.
+    # Событие — лишний IPv6-адрес (ULA): IPv4-адрес 10.254.254.254 на адаптере с DHCP выключал
+    # DHCP и сбрасывал полученный адрес — VM на время теряла сеть, и вместо «не уверен» был down.
+    $dhcpWas = (Get-NetIPInterface -InterfaceAlias $egress -AddressFamily IPv4).Dhcp
+    New-NetIPAddress -InterfaceAlias $egress -IPAddress fd00:254::254 -PrefixLength 128 -SkipAsSource $true | Out-Null
     $addedIp = $true
     # событие приходит, когда адрес прошёл проверку на дубликат (в VM ~4 с, замер 2026-10-09);
     # ответ geo идёт 3 с, так что «закрыто» надо успеть увидеть до свежего ответа
@@ -703,7 +717,8 @@ try {
     Check 'state=unsure, приложение не заморожено' { (St).state -eq 'unsure' -and -not (Frozen) }
     $w = WaitFor { (St).state -eq 'up' } 20
     Check "снова up после свежего ответа (geo отвечает за 3 с) за $w с" { $w }
-    Remove-NetIPAddress -IPAddress 10.254.254.254 -Confirm:$false; $addedIp = $false
+    Remove-NetIPAddress -IPAddress fd00:254::254 -Confirm:$false; $addedIp = $false
+    Restore-Dhcp
     Geo 'DE'
     $ports = @(Get-Content "$T\geo.log" | Select-Object -Last 10 | ForEach-Object { ($_ -split ' ')[1] })
     Check "geo: каждый запрос — новое соединение ($(@($ports | Select-Object -Unique).Count) разных портов из $($ports.Count))" { @($ports | Select-Object -Unique).Count -eq $ports.Count }
@@ -818,7 +833,8 @@ try {
     Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" | Where-Object { $_.CommandLine -match 'vpn-guard\.ps1.*\s(daemon|supervise)\b' } |
         ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
     Get-NetFirewallRule -DisplayName 'VPNGuard-Block' -ErrorAction SilentlyContinue | Remove-NetFirewallRule
-    if ($addedIp) { Remove-NetIPAddress -IPAddress 10.254.254.254 -Confirm:$false -ErrorAction SilentlyContinue }
+    if ($addedIp) { Remove-NetIPAddress -IPAddress fd00:254::254 -Confirm:$false -ErrorAction SilentlyContinue }
+    Restore-Dhcp
     if ($route6) { Remove-NetRoute -DestinationPrefix '2607:6bc0::/32' -InterfaceIndex $route6 -PolicyStore ActiveStore -Confirm:$false -ErrorAction SilentlyContinue }
     if ($route4) { Remove-NetRoute -DestinationPrefix '160.79.104.10/32' -InterfaceIndex $route4 -PolicyStore ActiveStore -Confirm:$false -ErrorAction SilentlyContinue }
     if ($loopId) { & pnputil.exe /remove-device $loopId | Out-Null; Write-Host "      KM-TEST Loopback удалён ($loopId)" }

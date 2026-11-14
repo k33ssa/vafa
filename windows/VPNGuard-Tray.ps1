@@ -74,11 +74,17 @@ $IconDead = New-ShieldIcon ([Drawing.Color]::FromArgb(240, 140, 20)) $true $true
 # переключения «Охрана включена».
 $GuardC = @{ T = $null; V = $false }
 $GuardSw = [Diagnostics.Stopwatch]::StartNew()
+# Задачу SYSTEM обычный (не повышенный) сеанс пользователя НЕ видит: Get-ScheduledTask
+# отвечает «не найдено», и трей считал охрану выключенной — пустой контур и «Охрана
+# выключена», хотя служба работала и блокировала (проверено в VM 2026-11-14). Тогда решает
+# status.json: unlock/«выключить охрану» пишут туда state=stopped; файла нет — тоже выключена.
 function Guard-On([switch]$Fresh) {
     $now = $GuardSw.Elapsed.TotalSeconds
     if (-not $Fresh -and $null -ne $GuardC.T -and $now - $GuardC.T -lt 30) { return $GuardC.V }
     $t = Get-ScheduledTask -TaskName VPNGuard -ErrorAction SilentlyContinue
-    $GuardC.V = [bool]($t -and $t.State -ne 'Disabled'); $GuardC.T = $now
+    if ($t) { $GuardC.V = ($t.State -ne 'Disabled') }
+    else { $s = Read-Status; $GuardC.V = [bool]($s -and "$($s.state)" -ne 'stopped') }
+    $GuardC.T = $now
     return $GuardC.V
 }
 
@@ -375,7 +381,33 @@ $refresh = {
         else { $ni.Icon = $IconUp; $ni.Text = 'Vafa: VPN поднят' }
     }
 }
+# Windows 11 прячет новый значок под стрелку «^», а в списке значков он значится как
+# «Windows PowerShell» (проверено в VM 2026-11-14). Один раз закрепить его на панели —
+# так же, как это делает сам пользователь (IsPromoted=1 в NotifyIconSettings, HKCU, без
+# прав администратора). Метка Promoted в HKCU\Software\Vafa: если потом пользователь сам
+# уберёт значок под «^», трей его выбор не перебивает. Запись появляется не сразу после
+# показа значка — пробуем первые ~30 с.
+$PromoteTries = 0
+$promote = {
+    try {
+        if ((Get-ItemProperty 'HKCU:\Software\Vafa' -Name Promoted -ErrorAction SilentlyContinue).Promoted -eq 1) { $promoteTimer.Stop(); return }
+        $done = $false
+        Get-ChildItem 'HKCU:\Control Panel\NotifyIconSettings' -ErrorAction SilentlyContinue | ForEach-Object {
+            $p = Get-ItemProperty $_.PSPath -ErrorAction SilentlyContinue
+            if ("$($p.ExecutablePath)" -like '*\WindowsPowerShell\v1.0\powershell.exe') {
+                Set-ItemProperty $_.PSPath -Name IsPromoted -Value 1 -Type DWord -ErrorAction SilentlyContinue; $done = $true
+            }
+        }
+        if ($done) {
+            New-Item 'HKCU:\Software\Vafa' -Force -ErrorAction SilentlyContinue | Out-Null
+            Set-ItemProperty 'HKCU:\Software\Vafa' -Name Promoted -Value 1 -Type DWord -ErrorAction SilentlyContinue
+        }
+        if ($done -or ++$script:PromoteTries -ge 10) { $promoteTimer.Stop() }
+    } catch { $promoteTimer.Stop() }
+}
+
 & $refresh
 Rebuild-Menu
 $timer = New-Object Windows.Forms.Timer; $timer.Interval = 2000; $timer.Add_Tick($refresh); $timer.Start()
+$promoteTimer = New-Object Windows.Forms.Timer; $promoteTimer.Interval = 3000; $promoteTimer.Add_Tick($promote); $promoteTimer.Start()
 [Windows.Forms.Application]::Run()

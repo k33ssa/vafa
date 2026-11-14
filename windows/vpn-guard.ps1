@@ -1660,6 +1660,14 @@ function Cmd-Unlock {
     foreach ($a in $apps) { Resume-App $a $all }
     Remove-FwRules
     Get-NetFirewallRule -Group $FwGroup -ErrorAction SilentlyContinue | Remove-NetFirewallRule -ErrorAction SilentlyContinue
+    # трею: охрана выключена. Задачу SYSTEM обычный сеанс пользователя не видит, и без этой
+    # записи трей судил бы по старому status.json (как на macOS — state=stopped)
+    try {
+        $o = [pscustomobject]@{ time = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds(); vpn = $false; state = 'stopped'
+                                iface = ''; country = ''; net = ''; net_ok = $false; net_error = ''; apps = @() }
+        $o | ConvertTo-Json -Depth 3 -Compress | Set-Content "$StatusPath.tmp" -Encoding UTF8
+        Move-Item "$StatusPath.tmp" $StatusPath -Force
+    } catch {}
     Write-Host 'готово: служба остановлена, запуск разрешён, процессы разморожены, правила брандмауэра сняты'
     if ($task) {
         Write-Host 'Задача VPNGuard выключена — сама охрана не вернётся (и после перезагрузки тоже).'

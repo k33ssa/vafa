@@ -143,10 +143,10 @@ brew uninstall --cask vafa # если ставил через Homebrew — уд�
 1. Скачать [Vafa-1.0.2-windows.zip](https://github.com/k33ssa/vafa/releases/download/v1.0.2/Vafa-1.0.2-windows.zip), распаковать.
 2. В папке `Vafa-windows` дважды щёлкнуть **`install.cmd`** → разрешить в окне UAC.
 
-Щит появится в трее (в Windows 11 новые значки по умолчанию прячутся под стрелку **^** у
-часов). Чтобы он был виден всегда: **Параметры → Персонализация → Панель задач → Другие
-значки в области уведомлений** — щит там, скорее всего, называется **Windows PowerShell** (трей запускается
-через PowerShell), или просто перетащить его из-под **^** на панель.
+Щит появится в трее. Windows 11 прячет новые значки под стрелку **^**, поэтому при первом
+запуске щит сам закрепляет себя на панели (один раз — если потом убрать его под **^**, он
+так и останется). В **Параметры → Персонализация → Панель задач → Другие значки в области
+уведомлений** он называется **Windows PowerShell**: трей запускается через PowerShell.
 Двойной щелчок по щиту — окно выбора приложений.
 
 ### Обновление (если уже установлено)
@@ -339,7 +339,7 @@ If the shield does not appear on macOS 26, enable Vafa in System Settings -> Men
 1. Download [Vafa-1.0.2-windows.zip](https://github.com/k33ssa/vafa/releases/download/v1.0.2/Vafa-1.0.2-windows.zip) and unzip it.
 2. In `Vafa-windows`, double-click `install.cmd` and accept the UAC prompt.
 
-The shield appears in the tray (on Windows 11 it may hide under the ^ arrow); double-click it to choose apps. To update, download the newer zip and run `install.cmd` again: your settings and app list are kept. To uninstall, run `powershell -ExecutionPolicy Bypass -File .\uninstall.ps1` from an admin PowerShell in that folder.
+The shield appears in the tray and pins itself to the taskbar once on first start (Windows 11 hides new icons under the ^ arrow; in the taskbar settings it is listed as “Windows PowerShell”); double-click it to choose apps. To update, download the newer zip and run `install.cmd` again: your settings and app list are kept. To uninstall, run `powershell -ExecutionPolicy Bypass -File .\uninstall.ps1` from an admin PowerShell in that folder.
 
 ### How it works
 

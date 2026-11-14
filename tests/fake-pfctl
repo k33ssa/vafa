@@ -10,6 +10,7 @@
 #   fail-load         — есть файл: загрузка правил падает (как при битом синтаксисе)
 #   fail-load-pass    — есть файл: падает только загрузка с правилом pass (запасной набор проходит)
 #   drop-table-entry  — есть файл: из таблицы «теряется» последний адрес (проверка сверки таблицы)
+#   FAKE_PF_KILL_DELAY — пауза на каждый pfctl -k (секунды): медленный обрыв соединений
 #   calls.log         — журнал вызовов: load-pass / load-block / kill … / enable / …
 emulate -L zsh
 D=${FAKE_PF_DIR:?}
@@ -41,6 +42,7 @@ pre=anchor
 [[ -n $anchor && $anchor != $ME ]] && pre="other.${anchor//[^A-Za-z0-9.]/_}"
 
 if (( ${#kills} )); then
+  [[ -n ${FAKE_PF_KILL_DELAY:-} ]] && sleep $FAKE_PF_KILL_DELAY   # медленный pfctl -k (тест 49)
   print -r -- "kill ${kills[*]}" >> calls.log
   exit 0
 fi

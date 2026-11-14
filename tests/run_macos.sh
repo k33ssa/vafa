@@ -639,7 +639,8 @@ python3 -c 'import socket,sys,time
 s=socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 s.bind(("127.0.0.1", int(sys.argv[1]))); s.listen(50); c=[]
 while True: c.append(s.accept()[0])' $HPORT &
-PIDS+=$!; sleep 0.5
+PIDS+=$!
+i=0; while (( i++ < 50 )) && ! nc -z 127.0.0.1 $HPORT 2>/dev/null; do sleep 0.1; done   # сервер готов
 pf_reset; iface utun9; INTERVAL=1 GEO_STALE=60 conf route geo
 rm -f $T/state/status.json
 VPN_GUARD_TEST=1 VPN_GUARD_CONF=$T/conf VPN_GUARD_STATE=$T/state \
@@ -725,8 +726,7 @@ print -r -- '#include <unistd.h>
 int main(void) { if (fork() == 0) { execl("/bin/sleep", "sleep", "1000", (char *)0); _exit(1); } for (;;) pause(); }' > $T/cli.c
 cc -o $T/cli/bin/claude $T/cli.c && codesign -s - -i test.claude-code --force $T/cli/bin/claude >/dev/null 2>&1
 $T/cli/bin/claude & CLI=$!; PIDS+=$CLI
-sleep 0.5
-CLIKID=$(pgrep -P $CLI sleep | head -1)
+CLIKID=''; i=0; while (( i++ < 50 )) && [[ -z $CLIKID ]]; do sleep 0.1; CLIKID=$(pgrep -P $CLI sleep | head -1); done
 check "подделка CLI запустила дочерний процесс" test -n "$CLIKID"
 pf_reset; geo RU
 CLIX="CLI_SIGS=( 'adhoc:test.claude-code:*' )
@@ -792,6 +792,25 @@ check "удаление: plist убран" test ! -e $T/plist
 check "удаление: в журнале «снимаю защиту»" grep -q "снимаю защиту" $T/uninst.log
 check "копия скрипта в /tmp убрана" eval '! ls /tmp/vafa-uninstall.* >/dev/null 2>&1'
 geo DE; mkdir -p $T/state
+
+# ---- 49. заморозка не ждёт обрыва соединений --------------------------------------------
+# 2026-11-14 07:04: правило встало в :11, а заморозка — в :15: демон 4 с обрывал соединения
+# по одному pfctl на адрес. Здесь каждый pfctl -k «тормозит» 0,3 с; адресов под охраной ~90 —
+# подряд это ~27 с, параллельно — доли секунды.
+print "49. заморозка сразу, обрыв соединений параллельно"
+pf_reset; iface utun9; geo DE
+export FAKE_PF_KILL_DELAY=0.3
+INTERVAL=1 conf route geo; start_daemon; vpn_is true 5
+nk=$(( $(cat $T/pf/anchor.table 2>/dev/null | wc -l) ))
+t0=$EPOCHREALTIME; : > $T/iface; event CHANGE
+i=0; while (( i++ < 60 )) && [[ "$(fake_state)" != T ]]; do sleep 0.1; done
+dt=$(( EPOCHREALTIME - t0 ))
+check "маршрут пропал — заморожено через $(printf %.1f $dt) с (адресов под охраной: $nk)" test $(( dt < 3 )) -eq 1
+sleep 1.5
+nkill=$(grep -c '^kill' $T/pf/calls.log)
+check "соединения ко всем адресам оборваны за ~1,5 с ($nkill вызовов на $nk адресов)" test $nkill -ge $nk
+unset FAKE_PF_KILL_DELAY
+stop_daemon; iface utun9
 
 print
 print "итог: прошло $PASS, упало $FAIL"

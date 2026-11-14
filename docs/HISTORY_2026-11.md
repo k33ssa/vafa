@@ -73,3 +73,12 @@ utun225. Место на диске: `rfid-mane` 67 ГБ — две рабочи
 OpenVPN (utun6) берёт только 10.x, Tailscale (utun4) — 100.64/10, Anthropic и остальное — Happ (utun225).
 `rfid-mane` — агентом по брифу: тяжёлые данные сняты с учёта во всех 5 рабочих копиях, совпадающие копии удалены,
 единственные копии (15 ГБ) перенесены в `~/rfid-mane-heavy-backup-2026-11-13`; история не переписывалась.
+
+**14.11 — место на диске (просьба пользователя).** Тяжёлые данные rfid-mane (31 файл, 15 ГБ) — на SSD
+`KINGSTON/rfid-mane-data/heavy-from-git-2026-11-13`, сверены `cmp` 31/31, с Мака удалены. `ml-training/v2`
+(stroyfond-ml-detection): 5 папок данных (15 968 файлов) — на SSD `stroyfond-ml/ml-training-v2-2026-11-14`, сверены,
+удалены; скрипты и файлы git на месте, указатель `ПЕРЕНЕСЕНО_НА_SSD.txt`. Удалены `OmniRoute/.build` (сборка Next.js,
+в .gitignore) и кэши Postman (472 папки Cache/Code Cache/GPUCache/Service Worker; IndexedDB, Local Storage, cookies
+не тронуты): 8,7 ГБ → 0,1 ГБ. Свободно 26 → 68 ГБ. Проверка через туннель 14.11: claude.ai и api.anthropic.com
+видят DE (FRA) — правил «direct» для Anthropic в xray нет. `~/Library/Containers`: агент насчитал < 1 ГБ, но
+застрял на `32FA0307-…` (песочница неизвестного приложения) — 22 ГБ из первого замера не объяснены.

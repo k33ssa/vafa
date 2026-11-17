@@ -79,9 +79,20 @@ fi
 install -m 644 -o root -g wheel $SRC/local.vpnguard.plist $PLIST
 
 launchctl bootout system $PLIST 2>/dev/null || true
+# bootout возвращается раньше, чем старый демон доработает (при остановке он закрывает сеть и
+# пишет статус): сразу после него bootstrap падал «Bootstrap failed: 5: Input/output error»,
+# и из-за set -e установка обрывалась до копирования Vafa.app (обновление через brew на другом
+# Маке, 2026-11-17). Ждём, пока служба исчезнет (до 15 с), и пробуем загрузить до 5 раз.
+for i in {1..30}; do launchctl print system/local.vpnguard >/dev/null 2>&1 || break; sleep 0.5; done
 # сначала enable: после «Охрана выключена» в Vafa служба disabled, и bootstrap падал
 launchctl enable system/local.vpnguard 2>/dev/null || true
-launchctl bootstrap system $PLIST
+LOADED=0
+for i in {1..5}; do
+  if launchctl bootstrap system $PLIST 2>/dev/null; then LOADED=1; break; fi
+  launchctl print system/local.vpnguard >/dev/null 2>&1 && { LOADED=1; break; }   # уже загружена
+  sleep 2
+done
+(( LOADED )) || print -ru2 -- "ВНИМАНИЕ: демон не загрузился (launchctl bootstrap). Повторить: sudo launchctl bootstrap system $PLIST"
 
 # мини-приложение в строке меню (собирается ./app/build.sh)
 if [[ -d "$SRC/app/Vafa.app" ]]; then
@@ -99,6 +110,7 @@ if [[ -d "$SRC/app/Vafa.app" ]]; then
 fi
 
 print -r -- ""
+(( LOADED )) || { print -ru2 -- "Установка не закончена: демон не запущен (см. выше)."; exit 5 }
 print -r -- "Установлено:"
 print -r -- "  /usr/local/bin/vpn-guard"
 print -r -- "  $CONF"

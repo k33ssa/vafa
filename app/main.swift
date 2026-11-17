@@ -372,11 +372,32 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
         item.menu = menu
         refresh()
         Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in self?.refresh() }
+        // macOS 26 может не пустить значок в строку меню («Разрешить в строке меню» выключено
+        // или запись осталась от старой сборки). Тогда у кнопки есть окно, но нет экрана —
+        // признак из разбора CodexBar#1440. Проверить через 8 с и один раз подсказать.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 8) { [weak self] in self?.checkStatusItemShown() }
         // первый запуск — сразу включить автозапуск при входе; дальше решает пользователь
         let d = UserDefaults.standard
         if !d.bool(forKey: "loginItemAsked") {
             d.set(true, forKey: "loginItemAsked")
             setLoginItem(true)
+        }
+    }
+
+    func checkStatusItemShown() {
+        guard #available(macOS 26.0, *) else { return }
+        let hidden = item.button?.window?.screen == nil
+        let d = UserDefaults.standard
+        guard hidden, !d.bool(forKey: "menuBarHintShown") else { return }
+        d.set(true, forKey: "menuBarHintShown")
+        let a = NSAlert()
+        a.messageText = "Значок Vafa не виден в строке меню"
+        a.informativeText = "Включите Vafa: Системные настройки → Строка меню → «Разрешить в строке меню». Охрана при этом работает — меню можно открыть, запустив Vafa ещё раз из «Программ»."
+        a.addButton(withTitle: "Открыть Настройки")
+        a.addButton(withTitle: "Понятно")
+        NSApp.activate(ignoringOtherApps: true)
+        if a.runModal() == .alertFirstButtonReturn {
+            NSWorkspace.shared.open(URL(fileURLWithPath: "/System/Applications/System Settings.app"))
         }
     }
 

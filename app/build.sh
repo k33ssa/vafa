@@ -26,5 +26,10 @@ cat > $APP/Contents/Info.plist <<'EOF'
   <key>LSMinimumSystemVersion</key><string>12.0</string>
 </dict></plist>
 EOF
-codesign -s - --force $APP >/dev/null 2>&1 || true
+# Стабильная локальная подпись (стандарт приложений, как у SimpleScreenTab): с ad-hoc «паспорт»
+# приложения — хеш сборки (cdhash), и каждое обновление система видит новой программой. На macOS 26
+# по ней ведётся список «Разрешить в строке меню» и место значка — после обновления значок мог
+# пропасть (разборы разработчиков: jcode#1793, CodexBar#1440). Нет сертификата — ad-hoc.
+ID=$(security find-identity -p codesigning 2>/dev/null | awk '/ScreenTab Local Signing/{print $2; exit}')
+codesign --force --sign "${ID:--}" $APP >/dev/null 2>&1 || codesign -s - --force $APP >/dev/null 2>&1 || true
 print -r -- "собрано: $PWD/$APP"

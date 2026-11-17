@@ -72,6 +72,14 @@
 
 ## §2. Закрыто
 
+### 2026-11-17 — настоящая причина «Bootstrap failed: 5»: карантин
+
+* [x] На другом Маке (macOS 27.2.1) 1.0.5 через brew тоже не запустила демон — даже с ожиданием и повторами. Журнал
+  launchd: «Plist has the com.apple.quarantine xattr set … Refusing to execute/trust quarantined program/file»
+  (error 155). Homebrew помечает скачанное карантином, install переносит его на `/usr/local/bin/vpn-guard` и plist.
+  После `sudo xattr -c` на них — `bootstrap` код 0, служба работает (пользователь, 19:03). Установщик теперь
+  снимает карантин с файлов демона сам. Ожидание и повторы bootstrap из 1.0.5 оставлены — не мешают.
+
 ### 2026-11-17 — релиз 1.0.5
 
 * [x] Релиз 1.0.5 — исправление установщика (bootstrap после bootout), по просьбе пользователя.

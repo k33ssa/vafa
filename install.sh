@@ -78,6 +78,14 @@ fi
 
 install -m 644 -o root -g wheel $SRC/local.vpnguard.plist $PLIST
 
+# Файлы из скачанного DMG (Homebrew, браузер) помечены карантином, и install его переносит.
+# launchd на новых macOS не загружает такую службу: «Plist has the com.apple.quarantine xattr
+# set … Refusing to execute/trust quarantined program/file» — снаружи это «Bootstrap failed: 5»
+# (macOS 27.2.1 через brew, журнал launchd 2026-11-17). Снять со всего, что поставили.
+for f in /usr/local/bin/vpn-guard $PLIST $CONF $COUNTRIES /usr/local/etc/vpn-guard.apps; do
+  [[ -e $f ]] && xattr -d com.apple.quarantine $f 2>/dev/null || true
+done
+
 launchctl bootout system $PLIST 2>/dev/null || true
 # bootout возвращается раньше, чем старый демон доработает (при остановке он закрывает сеть и
 # пишет статус): сразу после него bootstrap падал «Bootstrap failed: 5: Input/output error»,

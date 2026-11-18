@@ -93,6 +93,7 @@ start_daemon() {
   VPN_GUARD_RESOLVER=${RESOLVER:-$T/resolver} \
   VPN_GUARD_NET_MONITOR=${MONITOR:-"tail -n0 -F $T/events"} \
   VPN_GUARD_PROXY_CMD=${PROXY_CMD:-echo} VPN_GUARD_FREEZE_CLI=0 \
+  VPN_GUARD_SLOWLOG=${VPN_GUARD_SLOWLOG:-/tmp/vafa-slow-cycles.log} \
     zsh ./vpn-guard daemon >> $T/daemon.log 2>&1 &
   DPID=$!
   wait_status '"time"' 10 >/dev/null
@@ -835,34 +836,45 @@ sleep 1.5
 check "маршрут туннеля — событие: hold (load-block), страна перепроверяется" eval 'calls | grep -q "^load-block"'
 stop_daemon
 
-# ---- 51. Cloudflare отвечает медленно без событий сети — не «не уверен» -------------------
+# ---- 51. медленный запрос страны не рвёт связь; молчание всех — «не уверен» за ~3 с ------
 # 2026-11-18 20:09:21 (живой журнал, уже с фильтром awdl): «не подтверждена» без событий
-# сети — один перезапрос страны шёл дольше 3 с (ttl+2), и соединения рвались. Теперь прошлый
-# ответ держится до GEO_SLOW (12 с), пока туннель тот же и событий не было.
-print "51. медленный ответ Cloudflare без событий — VPN остаётся up"
+# сети — один перезапрос страны шёл дольше 3 с, и соединения рвались. Запросы теперь
+# независимые (новый каждую секунду): один зависший ничего не значит. Но если не отвечает
+# ни один — «не уверен» через GEO_DEAD (3 с), не позже: тихая смена сервера на том же
+# туннеле не должна оставаться незамеченной дольше.
+print "51. один медленный ответ Cloudflare — up; молчат все — «не уверен» за ~3 с"
 SPORT=$(( PORT + 2 ))
 python3 -c 'import http.server,os,sys,time
 d=sys.argv[2]
 class H(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
-        while os.path.exists(d+"/hang"): time.sleep(0.1)
+        try: os.rename(d+"/hang1", d+"/hang1.used"); one=True     # зависает один запрос
+        except OSError: one=False
+        while one or os.path.exists(d+"/hang"): time.sleep(0.1)
         b=open(d+"/www/trace","rb").read()
         self.send_response(200); self.send_header("Content-Length",str(len(b))); self.end_headers(); self.wfile.write(b)
     def log_message(self,*a): pass
 http.server.ThreadingHTTPServer(("127.0.0.1",int(sys.argv[1])),H).serve_forever()' $SPORT $T &
 PIDS+=$!
 i=0; while (( i++ < 50 )) && ! nc -z 127.0.0.1 $SPORT 2>/dev/null; do sleep 0.1; done
-pf_reset; iface utun9; geo DE; rm -f $T/hang
+pf_reset; iface utun9; geo DE; rm -f $T/hang $T/hang1 $T/hang1.used
 INTERVAL=1 GEO_TTL=1 GEO_STALE=60 conf route geo
 GEO_URLS_T="http://127.0.0.1:$SPORT/trace http://127.0.0.1:$SPORT/trace http://127.0.0.1:$SPORT/trace" start_daemon; vpn_is true 5
-sleep 1; : > $T/pf/calls.log
-touch $T/hang; sleep 6
-check "Cloudflare молчит 6 с без событий — по-прежнему up" st '"state":"up"'
+sleep 1; : > $T/pf/calls.log; : > $T/state/seen
+( repeat 60; do grep -o '"state":"[a-z]*"' $T/state/status.json >> $T/state/seen 2>/dev/null; sleep 0.1; done ) &
+SEENPID=$!
+touch $T/hang1; sleep 6; wait $SEENPID
+check "один запрос завис — он и правда был" test -e $T/hang1.used
+check "всё это время up (ни разу «не уверен»)" eval '! grep -qv "\"up\"" $T/state/seen'
 check "соединения не рвали, сеть не закрывали" eval '! calls | grep -qE "^kill|^load-block"'
-sleep 9
-check "молчит дольше 12 с — «не уверен»" st '"state":"unsure"'
-rm -f $T/hang
-check "ответ пришёл — снова up" wait_status '"state":"up"' 6
+t0=$EPOCHREALTIME; touch $T/hang
+wait_status '"state":"unsure"' 8 >/dev/null; dt=$(( EPOCHREALTIME - t0 ))
+check "молчат все запросы — «не уверен» через $(printf %.1f $dt) с (не позже 5)" test $(( dt < 5 )) -eq 1
+check "сеть закрыта, соединения оборваны" eval 'calls | grep -q "^kill" && ! pf_has_pass'
+geo RU; rm -f $T/hang
+check "ответ пришёл, а там RU — блок" vpn_is false 6
+geo DE
+check "снова DE — up" wait_status '"state":"up"' 6
 stop_daemon
 
 print

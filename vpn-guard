@@ -476,14 +476,14 @@ _nc_connected() {
 # и сразу же — по событию сети (см. wait_tick). Запрос — 1 КБ, curl живёт доли секунды.
 typeset -g GEO_LAST_T=0 GEO_LAST_IF='' GEO_LAST_CC='' GEO_GOOD_T=0 GEO_GOOD_CC='' GUARD_DOWN=0
 typeset -g GEO_FRESH=0 GEO_UNSURE=0 GEO_PEND=0
-typeset -g GEO_ASYNC=0 GEO_JOB_PID=0 GEO_JOB_IF='' GEO_JOB_N=0 GEO_JOB_T=0 GEO_WAKE=0   # фоновый опрос страны (только демон)
+typeset -g GEO_ASYNC=0 GEO_JOB_N=0 GEO_WAKE=0   # фоновый опрос страны (только демон)
 GEO_WAIT=1   # сколько секунд круг ждёт ответа о стране, когда он нужен сразу (после события)
 typeset -ga GEO_URLS=( https://1.1.1.1/cdn-cgi/trace https://1.0.0.1/cdn-cgi/trace
                        https://www.cloudflare.com/cdn-cgi/trace )
 [[ -n ${VPN_GUARD_GEO_URLS:-} ]] && GEO_URLS=( ${=VPN_GUARD_GEO_URLS} )   # для tests/run_macos.sh
 # страна — в REPLY (curl без awk и подоболочки)
 _geo_fetch() {
-  local -a opt=( -s --max-time 4 )
+  local -a opt=( -s --max-time ${3:-4} )
   local out l
   if [[ ${2:-} == proxy:* ]]; then opt+=( -x ${2#proxy:} )   # через прокси VPN-клиента
   elif [[ -n ${2:-} ]]; then opt+=( --interface $2 ); fi
@@ -521,74 +521,111 @@ _geo_apply() {
   GEO_LAST_CC=$cc GEO_LAST_T=$t GEO_LAST_IF=$i GEO_PEND=0 GEO_WAKE=0
 }
 
-# Ответа ещё нет. Свежий прошлый ответ для того же интерфейса (обычный перезапрос раз в
-# GEO_TTL) — держим его, иначе состояние мигало бы «не уверен» на каждом опросе. После
-# события сети (GEO_LAST_T=0), на новом интерфейсе и если опрос висит дольше GEO_TTL+2 с
-# (туннель завис) — «не уверен»: сеть к Anthropic закрыта, приложения не трогаются.
-#
-# Обычный перезапрос (без события сети, тот же интерфейс) держит прошлый ответ до
-# GEO_SLOW секунд (12 — три адреса по curl --max-time 4, как до фонового опроса). Было
-# ttl+2 = 3 с: один медленный ответ через туннель — и «не уверен» с обрывом соединений
-# к Anthropic (живой журнал 2026-11-18 20:09:21, без событий сети).
-GEO_SLOW=${VPN_GUARD_GEO_SLOW:-12}
-_geo_pending() {
-  local i=$1 ttl=$2 lim=$(( $2 + 2 ))
-  (( GEO_SLOW > lim )) && lim=$GEO_SLOW
-  if [[ $i == $GEO_LAST_IF ]] && (( GEO_LAST_T && EPOCHSECONDS - GEO_LAST_T <= lim )); then
-    GEO_PEND=0; return 0
-  fi
-  GEO_FRESH=0 GEO_PEND=1 GEO_WAKE=1
-  [[ $i == $GEO_LAST_IF ]] || GEO_LAST_CC=''
-  return 0
+# ---- фоновый опрос страны (демон, GEO_ASYNC=1) -------------------------------
+# Раньше (2026-11-13) запрос был один: curl по трём адресам подряд, и пока он шёл, демон
+# ничего не знал о стране. Один зависший запрос — и через 3 с «не уверен» с обрывом
+# соединений (журнал 2026-11-18 20:09:21, без событий сети), а если ждать дольше (1.0.7,
+# до 12 с) — столько же демон верил старой стране при тихой смене сервера на том же туннеле.
+# Теперь запросы независимые: новый — раз в GEO_TTL, а пока ответа нет — каждую секунду,
+# по очереди на разные адреса, каждый своим соединением (curl --max-time GEO_DEAD).
+# Один медленный запрос ничего не значит — ответит следующий. «Cloudflare молчит» — только
+# если GEO_DEAD секунд (3) не ответил ни один, или пусто ответили все адреса подряд.
+# После события сети ответы запросов, начатых до него, не берутся (GEO_FLUSH).
+typeset -gA GEO_JOBS=()   # номер → «pid|интерфейс|время начала»
+typeset -g GEO_START_T=0 GEO_SINCE=0 GEO_EMPTY=0 GEO_URL_I=0 GEO_FLUSH=0
+GEO_DEAD=3      # столько секунд без единого ответа — «Cloudflare молчит»
+GEO_MAXJOBS=4
+
+_geo_jobs_drop() {
+  local n f
+  for n in ${(k)GEO_JOBS}; do
+    f=$STATE_DIR/geo.job.$n
+    kill ${GEO_JOBS[$n]%%|*} 2>/dev/null; rm -f -- $f $f.tmp
+  done
+  GEO_JOBS=(); GEO_SINCE=0 GEO_EMPTY=0 GEO_FLUSH=0
 }
 
-# Ответ готов? Да — забрать и применить (0); нет — 1
+# есть готовый ответ? (для wait_tick — проснуться сразу)
+geo_ready() {
+  local n
+  for n in ${(k)GEO_JOBS}; do [[ -e $STATE_DIR/geo.job.$n ]] && return 0; done
+  return 1
+}
+
+# Забрать готовые ответы; самый свежий по времени начала — применить (0). Нет ответа — 1
 _geo_collect() {
-  local i=$1 f=$STATE_DIR/geo.job.$GEO_JOB_N cc
-  [[ -e $f ]] || return 1
-  cc=$(<$f); rm -f -- $f; GEO_JOB_PID=0
-  # срок GEO_TTL — от начала запроса, иначе при GEO_TTL=1 спрашивали бы раз в 2 с
-  [[ $GEO_JOB_IF == $i ]] && _geo_apply $i "$cc" $GEO_JOB_T
+  local i=$1 n v pid ji jt cc f best='' bt=-1
+  for n in ${(k)GEO_JOBS}; do
+    v=${GEO_JOBS[$n]}; pid=${v%%|*}; jt=${v##*|}; ji=${${v#*|}%|*}
+    f=$STATE_DIR/geo.job.$n
+    if [[ $ji != $i ]]; then   # интерфейс сменился — ответ уже не про него
+      kill $pid 2>/dev/null; rm -f -- $f $f.tmp; unset "GEO_JOBS[$n]"; continue
+    fi
+    if [[ -e $f ]]; then
+      cc=$(<$f); rm -f -- $f; unset "GEO_JOBS[$n]"
+      if [[ -n $cc ]]; then (( jt > bt )) && { best=$cc; bt=$jt }
+      else (( ++GEO_EMPTY )); fi
+    elif ! kill -0 $pid 2>/dev/null && [[ ! -e $f ]]; then   # умер без ответа
+      unset "GEO_JOBS[$n]"; (( ++GEO_EMPTY ))
+    fi
+  done
+  # ответ старее уже применённого не нужен (срок GEO_TTL — от начала запроса)
+  [[ -n $best ]] && (( bt >= GEO_LAST_T )) || return 1
+  GEO_SINCE=0 GEO_EMPTY=0
+  _geo_apply $i $best $bt
   return 0
 }
 
-# Демон (GEO_ASYNC=1) спрашивает страну в фоне: curl --max-time 4 по 2–3 адресам при
-# зависшем туннеле занимал до ~12 с, и всё это время круг стоял — заморозка по пропаже
-# маршрута ждала. Теперь круг идёт дальше, ответ подбирается на следующем (wait_tick
-# просыпается, как только он готов). check/status — по-прежнему синхронно.
+# check/status спрашивают синхронно (три адреса подряд), демон — в фоне.
 _geo_refresh() {
-  local i=$CUR_IF cc='' ttl=$GEO_TTL bind='' d f
+  local i=$CUR_IF ttl=$GEO_TTL bind='' d ds f url await=0 first=0 start=0 s
   (( GUARD_DOWN )) && ttl=$GEO_TTL_DOWN
   # режим прокси: свой «интерфейс» для кэша страны — смена прокси сбрасывает прошлый ответ
   [[ -n $VIA_PROXY ]] && i="proxy:$VIA_PROXY"
-  if (( GEO_ASYNC && GEO_JOB_PID )); then
-    if [[ $GEO_JOB_IF == $i ]] && _geo_collect $i; then :   # дальше: не пора ли спросить снова
-    elif (( GEO_JOB_PID == 0 )); then :   # ответ был про другой интерфейс — спросить заново
-    elif [[ $GEO_JOB_IF != $i ]] || ! kill -0 $GEO_JOB_PID 2>/dev/null; then
-      # интерфейс сменился — ответ уже не про него; опрос умер без ответа — спросить заново
-      kill $GEO_JOB_PID 2>/dev/null; rm -f -- $STATE_DIR/geo.job.$GEO_JOB_N; GEO_JOB_PID=0
-    else
-      _geo_pending $i $ttl; return 0
-    fi
-  fi
   d=$(( EPOCHSECONDS - GEO_LAST_T ))
-  # d < 0 — часы перевели назад: считать, что срок вышел
-  (( d < 0 || d >= ttl )) || [[ $i != $GEO_LAST_IF ]] || return 0
   # не через туннель — не спрашивать вовсе: запрос ушёл бы с настоящего адреса,
   # а ответ и так известен (VPN нет)
   if [[ $i == proxy:* ]]; then bind=$i
   elif (( GEO_BIND )); then _is_tun $i && bind=$i; fi
-  if (( GEO_BIND )) && [[ -z $bind ]]; then _geo_apply $i ''; return 0; fi
-  if (( GEO_ASYNC )); then
-    (( ++GEO_JOB_N ))
-    f=$STATE_DIR/geo.job.$GEO_JOB_N
-    { _geo_query $bind; print -r -- $REPLY > $f.tmp && mv -f -- $f.tmp $f } &!
-    GEO_JOB_PID=$! GEO_JOB_IF=$i GEO_JOB_T=$EPOCHSECONDS
-    _geo_pending $i $ttl
-    # ответ нужен сейчас (после события сети, новый интерфейс): живой туннель отвечает за
-    # 0,05–0,3 с — подождать до GEO_WAIT, чтобы решить в этом же круге, как раньше; дольше
-    # не стоим — зависший туннель больше не держит круг
-    if (( GEO_PEND )); then
+  if (( ! GEO_ASYNC )) || { (( GEO_BIND )) && [[ -z $bind ]] }; then
+    (( GEO_ASYNC )) && _geo_jobs_drop
+    # d < 0 — часы перевели назад: считать, что срок вышел
+    (( d < 0 || d >= ttl )) || [[ $i != $GEO_LAST_IF ]] || return 0
+    if (( GEO_BIND )) && [[ -z $bind ]]; then _geo_apply $i ''; return 0; fi
+    _geo_query $bind; _geo_apply $i $REPLY
+    return 0
+  fi
+
+  (( GEO_FLUSH )) && _geo_jobs_drop
+  _geo_collect $i
+  # ждём первого ответа: после события сети (GEO_LAST_T=0) или на новом интерфейсе
+  { [[ $i != $GEO_LAST_IF ]] || (( GEO_LAST_T == 0 )) } && await=1
+  # Cloudflare молчит: GEO_DEAD секунд ни одного ответа, или пусто ответили все адреса
+  if (( GEO_SINCE )) && (( GEO_EMPTY >= ${#GEO_URLS} || EPOCHSECONDS - GEO_SINCE >= GEO_DEAD || EPOCHSECONDS < GEO_SINCE )); then
+    s=$GEO_SINCE; GEO_SINCE=0 GEO_EMPTY=0
+    _geo_apply $i '' $s
+    return 0
+  fi
+  d=$(( EPOCHSECONDS - GEO_LAST_T )); ds=$(( EPOCHSECONDS - GEO_START_T ))
+  if (( await || GEO_SINCE )); then
+    (( ds >= 1 || ds < 0 || ${#GEO_JOBS} == 0 )) && start=1   # ответа нет — ещё запрос, раз в секунду
+  elif (( d < 0 || d >= ttl )); then start=1; fi
+  if (( start && ${#GEO_JOBS} < GEO_MAXJOBS )); then
+    (( ++GEO_JOB_N )); f=$STATE_DIR/geo.job.$GEO_JOB_N
+    (( GEO_URL_I = GEO_URL_I % ${#GEO_URLS} + 1 ))
+    url=$GEO_URLS[$GEO_URL_I]
+    { _geo_fetch $url "$bind" $GEO_DEAD; print -r -- $REPLY > $f.tmp && mv -f -- $f.tmp $f } &!
+    GEO_JOBS[$GEO_JOB_N]="$!|$i|$EPOCHSECONDS"
+    GEO_START_T=$EPOCHSECONDS
+    (( GEO_SINCE )) || { GEO_SINCE=$EPOCHSECONDS; first=1 }
+  fi
+  if (( await )); then
+    # «не уверен»: сеть к Anthropic закрыта, приложения не трогаются
+    GEO_FRESH=0 GEO_PEND=1 GEO_WAKE=1
+    [[ $i == $GEO_LAST_IF ]] || GEO_LAST_CC=''
+    # ответ нужен сейчас: живой туннель отвечает за 0,05–0,3 с — подождать до GEO_WAIT,
+    # чтобы решить в этом же круге; дольше не стоим — зависший туннель не держит круг
+    if (( first )); then
       local tend=$(( EPOCHREALTIME + GEO_WAIT ))
       while (( EPOCHREALTIME < tend )); do
         _geo_collect $i && return 0
@@ -596,8 +633,9 @@ _geo_refresh() {
       done
     fi
   else
-    _geo_query $bind; _geo_apply $i $REPLY
+    GEO_PEND=0
   fi
+  return 0
 }
 
 # geo, geo:!RU — страна выхода НЕ из списка стран блокировки (BAD_CC; у geo:!…
@@ -1409,6 +1447,19 @@ prune_stale_locks() {
 # смену маршрутов и адресов: RTM_GET шлёт любой `route get`, в том числе наш же
 # _default_iface — без фильтра демон будил бы сам себя.
 typeset -g NET_FD='' NET_RETRY_T=0 NET_EVENT=0 NET_HARD=0 CYCLE_T0=0 CYCLE_N=0
+# Самодиагностика: круг (без ожидания) дольше CY_SLOW с — в журнал, по шагам. В тестах
+# 2026-11-18 круг изредка замирал на несколько секунд (заморозка через 5,5 с вместо 1),
+# а чем был занят — видно не было.
+typeset -g CY_MARKS='' CY_SLOW=2
+cy_mark() { CY_MARKS+=" $1=$(( (EPOCHREALTIME - CYCLE_T0) * 1000 ))" }
+cy_report() {
+  local d=$(( EPOCHREALTIME - CYCLE_T0 )) m w
+  (( d >= CY_SLOW )) || return 0
+  for w in ${=CY_MARKS}; do m+=" ${w%%=*}=${${w#*=}%.*}"; done
+  log "круг $CYCLE_N занял $(printf %.1f $d) с (мс от начала:$m)"
+  [[ -n ${VPN_GUARD_SLOWLOG:-} ]] && print -r -- "$(date +%T) круг $CYCLE_N $(printf %.1f $d) с:$m" >> $VPN_GUARD_SLOWLOG
+  return 0
+}
 typeset -g TUN_ID='' TUN_IDX=''   # «паспорт» туннеля, через который пускали: имя|номер|адрес
 
 # паспорт интерфейса — в REPLY (VPN_GUARD_IFACE_FILE.id — для тестов)
@@ -1479,10 +1530,10 @@ net_watch_stop() {
 # без монитора сети: ждать $1 с, но проснуться, когда фоновый ответ о стране готов;
 # 1 — фонового опроса нет
 geo_wait() {
-  (( GEO_JOB_PID && GEO_WAKE )) || return 1
+  (( ${#GEO_JOBS} && GEO_WAKE )) || return 1
   local tend=$(( EPOCHREALTIME + $1 ))
   while (( EPOCHREALTIME < tend )); do
-    [[ -e $STATE_DIR/geo.job.$GEO_JOB_N ]] && return 0
+    geo_ready && return 0
     zselect -t 5 2>/dev/null
   done
   return 0
@@ -1503,14 +1554,14 @@ wait_tick() {
     return 0
   fi
   local got=0 eof=0 r0
-  if (( GEO_JOB_PID && GEO_WAKE )); then
+  if (( ${#GEO_JOBS} && GEO_WAKE )); then
     # опрос страны в фоне — проснуться, как только ответ готов (новый круг сразу)
     tend=$(( EPOCHREALTIME + wait ))
     while (( EPOCHREALTIME < tend )); do
       r0=$EPOCHREALTIME
       read -t 0.05 -u $NET_FD line && { got=1; break }
       (( EPOCHREALTIME - r0 < 0.03 )) && { eof=1; break }   # поток кончился, а не таймаут
-      [[ -e $STATE_DIR/geo.job.$GEO_JOB_N ]] && return 0
+      geo_ready && return 0
     done
     (( got || eof )) || return 0
   elif read -t $wait -u $NET_FD line; then
@@ -1560,7 +1611,7 @@ geo_active() {
 # но к серверу в стране блокировки, пропускало запросы до ответа Cloudflare:
 # pf различает только имя интерфейса.
 net_event_hold() {
-  GEO_LAST_T=0
+  GEO_LAST_T=0 GEO_FLUSH=1
   geo_active || return 0
   [[ $PF_CUR == via:* ]] && pf_apply hold
   return 0
@@ -1583,8 +1634,9 @@ cmd_daemon() {
   # убрать. «Охрана выключена» в Vafa и uninstall после остановки зовут unlock — он снимает pf.
   GEO_ASYNC=1
   rm -f -- $STATE_DIR/geo.job.*(N)   # ответы опросов прошлого запуска
-  trap 'pf_apply hold; write_status stopped; net_watch_stop; (( GEO_JOB_PID )) && kill $GEO_JOB_PID 2>/dev/null; exit 0' TERM INT HUP
-  local a last=init state prev_state=init down_since=0 mt
+  rm -f -- $STATE_DIR/geo.job.*(N)   # ответы опросов прошлого запуска
+  trap 'pf_apply hold; write_status stopped; net_watch_stop; _geo_jobs_drop; exit 0' TERM INT HUP
+  local a last=init state prev_state=init down_since=0 mt why wt0
   conf_mtime; mt=$REPLY
   log "vpn-guard запущен: правила=[${VPN_CHECK[*]}] ($VPN_REQUIRE), при падении VPN=$ON_DOWN, блокировка запуска=$LOCK_LAUNCH, интервал=${INTERVAL}с, страны блокировки: ${BAD_CC[*]:-не заданы}; сеть к Anthropic закрыта до первой проверки"
   (( ${#APPS} )) || log "ВНИМАНИЕ: список APPS пуст — сторожится только сеть"
@@ -1609,7 +1661,7 @@ cmd_daemon() {
       (( NET_WATCH )) || net_watch_stop
     fi
 
-    CYCLE_T0=$EPOCHREALTIME
+    CYCLE_T0=$EPOCHREALTIME CY_MARKS=''
     (( CYCLE_N++ ))
     default_iface_r; CUR_IF=$REPLY   # один снимок на круг — им пользуются и проверка, и pf
     if _is_tun $CUR_IF; then VIA_PROXY=''; else proxy_check; fi
@@ -1623,7 +1675,9 @@ cmd_daemon() {
       (( NET_HARD )) && pf_kill_states
     fi
     # сеть поменялась — имена перерезолвить тем же DNS, каким сейчас пользуются приложения
+    cy_mark route
     hosts_refresh $NET_EVENT
+    cy_mark hosts
 
     # up — VPN есть и страна подтверждена; unsure — маршрут есть, но страна не
     # подтверждена свежим ответом (или идёт GRACE); down — VPN нет
@@ -1636,11 +1690,13 @@ cmd_daemon() {
       (( EPOCHSECONDS < down_since )) && down_since=$(( EPOCHSECONDS - GRACE ))
       if (( EPOCHSECONDS - down_since >= GRACE )); then state=down; else state=unsure; fi
     fi
+    cy_mark check
 
     # снимок процессов: при блокировке и смене состояния — каждый круг, иначе раз в PS_EVERY с
     if [[ $state != up || $prev_state != up ]] || (( EPOCHSECONDS - PS_T >= PS_EVERY || EPOCHSECONDS < PS_T )); then
       ps_snap
     fi
+    cy_mark ps
 
     case $state in
       (up)
@@ -1665,7 +1721,10 @@ cmd_daemon() {
         # вошли в «не уверен» — оборвать открытые соединения один раз: через туннель с
         # неподтверждённым выходом не должно ходить и то, что открыли раньше
         [[ $prev_state != unsure ]] && (( PF_KILL_CYCLE != CYCLE_N )) && pf_kill_states
-        log_every unsure 60 "страна выхода не подтверждена (маршрут: $CUR_IF, страна: ${GEO_LAST_CC:-?}) — сеть к Anthropic закрыта, приложения не трогаю"
+        # причина — в журнал: после события сети ждём первый ответ, или Cloudflare молчит
+        if (( ! GEO_UNSURE )); then why='VPN пропал, идёт GRACE'
+        elif (( GEO_PEND )); then why='после события сети, жду ответ'; else why="Cloudflare не отвечает ${GEO_DEAD} с"; fi
+        log_every unsure 60 "страна выхода не подтверждена ($why; маршрут: $CUR_IF, страна: ${GEO_LAST_CC:-?}) — сеть к Anthropic закрыта, приложения не трогаю"
         ;;
       (down)
         pf_apply block                # сеть — первой, до заморозки
@@ -1691,9 +1750,18 @@ cmd_daemon() {
     esac
     # CLI убрали из охраны (FREEZE_CLI=0), пока он заморожен, — разморозить и вернуть запуск
     if (( ! FREEZE_CLI && CLI_FROZEN )); then resume_cli; unlock_app $CLI_KEY; fi
+    cy_mark act
     write_status $state
+    cy_mark status
+    cy_report
     prev_state=$state
+    wt0=$EPOCHREALTIME
     wait_tick
+    # ожидание не должно быть дольше INTERVAL: если вышло — тоже в журнал
+    if (( EPOCHREALTIME - wt0 > INTERVAL + CY_SLOW )); then
+      log "ожидание между кругами заняло $(printf %.1f $(( EPOCHREALTIME - wt0 ))) с при INTERVAL=$INTERVAL"
+      [[ -n ${VPN_GUARD_SLOWLOG:-} ]] && print -r -- "$(date +%T) ожидание $(printf %.1f $(( EPOCHREALTIME - wt0 ))) с, INTERVAL=$INTERVAL" >> $VPN_GUARD_SLOWLOG
+    fi
   done
 }
 

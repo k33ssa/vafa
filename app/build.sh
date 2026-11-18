@@ -21,7 +21,7 @@ cat > $APP/Contents/Info.plist <<'EOF'
   <key>CFBundleIconFile</key><string>Vafa</string>
   <key>CFBundleExecutable</key><string>VPNGuard</string>
   <key>CFBundlePackageType</key><string>APPL</string>
-  <key>CFBundleShortVersionString</key><string>1.0.7</string>
+  <key>CFBundleShortVersionString</key><string>1.0.8</string>
   <key>LSUIElement</key><true/>
   <key>LSMinimumSystemVersion</key><string>12.0</string>
 </dict></plist>

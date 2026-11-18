@@ -39,6 +39,14 @@ brew install --cask k33ssa/tap/vafa
 
 Homebrew попросит пароль администратора: демон ставится от root.
 
+**Нет Homebrew?** В macOS его нет по умолчанию. Поставить одной командой (официальная, с [brew.sh](https://brew.sh)),
+потом выполнить строки, которые установщик покажет в конце (`Next steps`, чтобы `brew` находился в Терминале), и
+вернуться к команде выше:
+
+```bash
+/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+```
+
 **Автообновление.** `brew upgrade` подтягивает новые версии. Чтобы Homebrew обновлял всё сам в фоне
 (раз в сутки), один раз выполнить:
 
@@ -324,7 +332,15 @@ All versions: [Releases](https://github.com/k33ssa/vafa/releases).
 brew install --cask k33ssa/tap/vafa
 ```
 
-Homebrew asks for the admin password because the daemon runs as root. Without Homebrew: open the DMG and run `sudo ./install.sh` from the mounted volume.
+Homebrew asks for the admin password because the daemon runs as root.
+
+**No Homebrew?** macOS doesn't ship with it. Install it with the official one-liner from [brew.sh](https://brew.sh), run the lines it prints under `Next steps` (so `brew` is on your PATH), then run the command above:
+
+```bash
+/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+```
+
+Or without Homebrew at all: open the DMG and run `sudo ./install.sh` from the mounted volume.
 
 - Update: `brew upgrade --cask vafa`
 - Automatic background updates: `brew tap homebrew/autoupdate && brew autoupdate start --upgrade --cleanup --sudo` (Vafa needs the admin password, so without `--sudo` background updates skip it; `--sudo` asks in a dialog and needs `brew install pinentry-mac`)

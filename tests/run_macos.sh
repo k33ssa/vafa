@@ -41,7 +41,8 @@ geo DE
 python3 -m http.server $PORT --bind 127.0.0.1 --directory $T/www > $T/http.log 2>&1 &
 PIDS+=$!
 : > $T/events
-event() { print -r -- "RTM_${1:-CHANGE}: test" >> $T/events }
+# сообщение route monitor кончается пустой строкой — демон разбирает его целиком
+event() { print -r -- "RTM_${1:-CHANGE}: test"$'\n' >> $T/events }
 iface() { print -r -- $1 > $T/iface }   # «маршрут по умолчанию»
 iface utun9
 # резолвер для BLOCK_HOSTS: публичные адреса берутся, служебные (127.*, 198.18/15, fe80::) — нет
@@ -87,7 +88,7 @@ start_daemon() {
   rm -f $T/state/status.json
   VPN_GUARD_TEST=1 VPN_GUARD_CONF=$T/conf VPN_GUARD_STATE=$T/state \
   VPN_GUARD_APPS=$T/no-apps-file VPN_GUARD_COUNTRIES=$T/countries \
-  VPN_GUARD_GEO_URLS="http://127.0.0.1:$PORT/trace" VPN_GUARD_GEO_BIND=${GEO_BIND:-0} \
+  VPN_GUARD_GEO_URLS=${GEO_URLS_T:-"http://127.0.0.1:$PORT/trace"} VPN_GUARD_GEO_BIND=${GEO_BIND:-0} \
   VPN_GUARD_IFACE_FILE=$T/iface VPN_GUARD_PFCTL=$FAKEPF FAKE_PF_DIR=$T/pf \
   VPN_GUARD_RESOLVER=${RESOLVER:-$T/resolver} \
   VPN_GUARD_NET_MONITOR=${MONITOR:-"tail -n0 -F $T/events"} \
@@ -448,11 +449,11 @@ stop_daemon
 # ---- 31. события сети: рвём соединения только если это событие туннеля --------------
 print "31. событие чужого интерфейса не рвёт соединения; туннеля — рвёт"
 pf_reset; print -r -- 'utun9|29|10.8.0.2' > $T/iface.id; conf route geo; geo DE; start_daemon; vpn_is true 5
-: > $T/pf/calls.log; print -r -- "RTM_IFINFO: iface status change: len 112, if# 4, flags:<UP>" >> $T/events; sleep 1.5
+: > $T/pf/calls.log; print -r -- "RTM_IFINFO: iface status change: len 112, if# 4, flags:<UP>"$'\n' >> $T/events; sleep 1.5
 check "IFINFO другого интерфейса (if# 4, awdl0/мост) — без обрыва" eval '! calls | grep -q "^kill"'
 : > $T/pf/calls.log; event NEWADDR; sleep 1.5
 check "NEWADDR (новый адрес IPv6) — без обрыва" eval '! calls | grep -q "^kill"'
-: > $T/pf/calls.log; print -r -- "RTM_IFINFO: iface status change: len 112, if# 29, flags:<UP>" >> $T/events; sleep 1.5
+: > $T/pf/calls.log; print -r -- "RTM_IFINFO: iface status change: len 112, if# 29, flags:<UP>"$'\n' >> $T/events; sleep 1.5
 check "IFINFO самого туннеля (if# 29) — обрыв" eval 'calls | grep -q "^kill"'
 vpn_is true 3
 : > $T/pf/calls.log; print -r -- 'utun9|29|10.8.0.77' > $T/iface.id; event CHANGE; sleep 1.5
@@ -653,10 +654,12 @@ DPID=$!
 wait_status '"time"' 10 >/dev/null
 i=0; while (( i++ < 30 )) && ! pgrep -f "tail -n0 -F $T/events" >/dev/null; do sleep 0.1; done; sleep 0.2
 check "ответа нет — «не уверен», не «поднят» и не блокировка" wait_status '"state":"unsure"' 3
+# сразу, пока «не уверен»: через 4 с curl сдаётся, прошлой страны нет — это уже «VPN нет»
+# и заморозка (так и надо). Проверка после sleep 2 под нагрузкой Мака съезжала за 4 с.
+check "приложение не заморожено (страна не подтверждена)" test "$(fake_state)" != T
 c1=$(grep -o '"cycle":[0-9]*' $T/state/status.json | cut -d: -f2); sleep 2
 c2=$(grep -o '"cycle":[0-9]*' $T/state/status.json | cut -d: -f2)
 check "круг идёт, пока Cloudflare молчит (было $c1, стало $c2)" test $(( c2 - c1 )) -ge 1
-check "приложение не заморожено (страна не подтверждена)" test "$(fake_state)" != T
 t0=$EPOCHREALTIME; iface en0; event CHANGE
 wait_status '"state":"down"' 3 >/dev/null
 dt=$(( EPOCHREALTIME - t0 ))
@@ -811,6 +814,56 @@ nkill=$(grep -c '^kill' $T/pf/calls.log)
 check "соединения ко всем адресам оборваны за ~1,5 с ($nkill вызовов на $nk адресов)" test $nkill -ge $nk
 unset FAKE_PF_KILL_DELAY
 stop_daemon; iface utun9
+
+# ---- 50. события AWDL (AirDrop/Handoff) не трогают сеть ----------------------------------
+# 2026-11-18: wifip2pd каждые ~1,5 мин меняет маршруты на awdl0 — демон закрывал сеть,
+# переспрашивал страну и рвал соединения к Anthropic (до 280 раз в день).
+print "50. маршруты awdl0/llw0 — не событие сети"
+pf_reset; iface utun9; geo DE
+INTERVAL=1 conf route geo; start_daemon; vpn_is true 5
+: > $T/pf/calls.log
+for k in 1 2 3; do
+  print -r -- $'RTM_ADD: Add Route: len 140, pid: 49464, seq 9191, errno 0, flags:<HOST,DONE,STATIC>\nlocks:  inits: <expire>\nsockaddrs: <DST,GATEWAY>\n fe80::4b2:75ff:fe76:7cad%awdl0 index: 18 6.b2.75.76.7c.ad\n' >> $T/events
+  print -r -- $'RTM_DELETE: Delete Route: len 168, pid: 49464, seq 9208, errno 3, flags:<UP,HOST>\nsockaddrs: <DST,GATEWAY,IFA>\n fe80::1%llw0 index: 19\n' >> $T/events
+done
+sleep 2
+check "awdl0/llw0: ни hold (load-block), ни обрыва соединений" eval '! calls | grep -qE "^kill|^load-block"'
+check "и по-прежнему up" vpn_is true 1
+: > $T/pf/calls.log
+print -r -- $'RTM_ADD: Add Route: len 140, pid: 0\nsockaddrs: <DST,GATEWAY>\n 1.2.3.0 10.8.0.1 index: 29 utun9\n' >> $T/events
+sleep 1.5
+check "маршрут туннеля — событие: hold (load-block), страна перепроверяется" eval 'calls | grep -q "^load-block"'
+stop_daemon
+
+# ---- 51. Cloudflare отвечает медленно без событий сети — не «не уверен» -------------------
+# 2026-11-18 20:09:21 (живой журнал, уже с фильтром awdl): «не подтверждена» без событий
+# сети — один перезапрос страны шёл дольше 3 с (ttl+2), и соединения рвались. Теперь прошлый
+# ответ держится до GEO_SLOW (12 с), пока туннель тот же и событий не было.
+print "51. медленный ответ Cloudflare без событий — VPN остаётся up"
+SPORT=$(( PORT + 2 ))
+python3 -c 'import http.server,os,sys,time
+d=sys.argv[2]
+class H(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        while os.path.exists(d+"/hang"): time.sleep(0.1)
+        b=open(d+"/www/trace","rb").read()
+        self.send_response(200); self.send_header("Content-Length",str(len(b))); self.end_headers(); self.wfile.write(b)
+    def log_message(self,*a): pass
+http.server.ThreadingHTTPServer(("127.0.0.1",int(sys.argv[1])),H).serve_forever()' $SPORT $T &
+PIDS+=$!
+i=0; while (( i++ < 50 )) && ! nc -z 127.0.0.1 $SPORT 2>/dev/null; do sleep 0.1; done
+pf_reset; iface utun9; geo DE; rm -f $T/hang
+INTERVAL=1 GEO_TTL=1 GEO_STALE=60 conf route geo
+GEO_URLS_T="http://127.0.0.1:$SPORT/trace http://127.0.0.1:$SPORT/trace http://127.0.0.1:$SPORT/trace" start_daemon; vpn_is true 5
+sleep 1; : > $T/pf/calls.log
+touch $T/hang; sleep 6
+check "Cloudflare молчит 6 с без событий — по-прежнему up" st '"state":"up"'
+check "соединения не рвали, сеть не закрывали" eval '! calls | grep -qE "^kill|^load-block"'
+sleep 9
+check "молчит дольше 12 с — «не уверен»" st '"state":"unsure"'
+rm -f $T/hang
+check "ответ пришёл — снова up" wait_status '"state":"up"' 6
+stop_daemon
 
 print
 print "итог: прошло $PASS, упало $FAIL"

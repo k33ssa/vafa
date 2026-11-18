@@ -525,9 +525,16 @@ _geo_apply() {
 # GEO_TTL) — держим его, иначе состояние мигало бы «не уверен» на каждом опросе. После
 # события сети (GEO_LAST_T=0), на новом интерфейсе и если опрос висит дольше GEO_TTL+2 с
 # (туннель завис) — «не уверен»: сеть к Anthropic закрыта, приложения не трогаются.
+#
+# Обычный перезапрос (без события сети, тот же интерфейс) держит прошлый ответ до
+# GEO_SLOW секунд (12 — три адреса по curl --max-time 4, как до фонового опроса). Было
+# ttl+2 = 3 с: один медленный ответ через туннель — и «не уверен» с обрывом соединений
+# к Anthropic (живой журнал 2026-11-18 20:09:21, без событий сети).
+GEO_SLOW=${VPN_GUARD_GEO_SLOW:-12}
 _geo_pending() {
-  local i=$1 ttl=$2
-  if [[ $i == $GEO_LAST_IF ]] && (( GEO_LAST_T && EPOCHSECONDS - GEO_LAST_T <= ttl + 2 )); then
+  local i=$1 ttl=$2 lim=$(( $2 + 2 ))
+  (( GEO_SLOW > lim )) && lim=$GEO_SLOW
+  if [[ $i == $GEO_LAST_IF ]] && (( GEO_LAST_T && EPOCHSECONDS - GEO_LAST_T <= lim )); then
     GEO_PEND=0; return 0
   fi
   GEO_FRESH=0 GEO_PEND=1 GEO_WAKE=1
@@ -1426,10 +1433,23 @@ net_watch_start() {
   (( NET_WATCH )) || return 0
   [[ -z $NET_FD ]] || return 0
   (( EPOCHSECONDS >= NET_RETRY_T )) || return 0
-  # IFINFO — с номером интерфейса (if# N): «жёстким» считается только событие туннеля
+  # IFINFO — с номером интерфейса (if# N): «жёстким» считается только событие туннеля.
+  # Сообщение разбирается целиком (до пустой строки): события AWDL/LLW (awdl0, llw0 —
+  # AirDrop, Handoff, Universal Control; wifip2pd добавляет и удаляет там маршруты каждые
+  # ~1,5 мин) пропускаются. Иначе каждое из них закрывало сеть, переспрашивало страну и
+  # рвало соединения к Anthropic — с 13.11 до 280 раз в день (журнал 2026-11-18).
   exec {NET_FD}< <(${=NET_MONITOR} 2>/dev/null |
-    awk '/^RTM_IFINFO/{n=""; if (match($0,/if# [0-9]+/)) n=substr($0,RSTART+4,RLENGTH-4); print "RTM_IFINFO if#" n; fflush(); next}
-         /^RTM_(ADD|DELETE|CHANGE|NEWADDR|DELADDR)/{print $1; fflush()}')
+    awk 'function out() {
+           if (hdr != "" && !skip) {
+             if (hdr ~ /^RTM_IFINFO/) { n=""; if (match(hdr,/if# [0-9]+/)) n=substr(hdr,RSTART+4,RLENGTH-4); print "RTM_IFINFO if#" n }
+             else if (hdr ~ /^RTM_(ADD|DELETE|CHANGE|NEWADDR|DELADDR)/) { split(hdr,f," "); print f[1] }
+             fflush()
+           }
+           hdr=""; skip=0
+         }
+         /^RTM_/ { out(); hdr=$0; next }
+         hdr != "" && /(awdl|llw)[0-9]/ { skip=1 }
+         /^[[:space:]]*$/ { out() }')
 }
 
 # Монитор живёт в подоболочке (route | awk) и сам не умирает: пока сеть молчит, ему

@@ -877,6 +877,83 @@ geo DE
 check "снова DE — up" wait_status '"state":"up"' 6
 stop_daemon
 
+# ---- 52. медленные ps и codesign не держат круг ----------------------------------------
+# 2026-11-19: под перегрузкой Мака ps отвечал по 5 с, а запуск симулятора давал десятки
+# codesign подряд — круг вставал на 5–10 с, и демон в это время не видел ни маршрута, ни
+# страны. Теперь оба — в фоне, круг ждёт их не дольше 0,15 с.
+print "52. ps по 4 с и codesign по 2 с: круг идёт, пропажа маршрута ловится сразу"
+mkdir -p $T/slowbin
+print -r -- '#!/bin/sh
+sleep 4; exec /bin/ps "$@"' > $T/slowbin/ps
+print -r -- '#!/bin/sh
+case "$*" in *vafa-test*) sleep 2;; esac   # медленно — только про тестовые бандлы
+exec /usr/bin/codesign "$@"' > $T/slowbin/codesign
+chmod 755 $T/slowbin/ps $T/slowbin/codesign
+$T/elsewhere/Copy.app/Contents/MacOS/sig & COPY=$!; PIDS+=$COPY
+sleep 0.3
+pf_reset; iface utun9; geo DE
+CONF_EXTRA="APPS=( \"$T/Sig.app\" )" INTERVAL=1 GEO_TTL=1 conf route geo
+: > /tmp/vafa-slow-cycles.log
+PATH=$T/slowbin:$PATH start_daemon; vpn_is true 8
+c1=$(grep -o '"cycle":[0-9]*' $T/state/status.json | cut -d: -f2); sleep 3
+c2=$(grep -o '"cycle":[0-9]*' $T/state/status.json | cut -d: -f2)
+check "за 3 с прошло кругов: $(( c2 - c1 )) (ps и codesign висят по 4 с)" test $(( c2 - c1 )) -ge 2
+: > $T/pf/calls.log; t0=$EPOCHREALTIME; : > $T/iface; event CHANGE
+i=0; while (( i++ < 50 )) && pf_has_pass; do sleep 0.1; done; dt=$(( EPOCHREALTIME - t0 ))
+check "маршрут пропал — сеть закрыта через $(printf %.1f $dt) с, не дожидаясь ps" test $(( dt < 1.5 )) -eq 1
+i=0; while (( i++ < 150 )) && [[ "$(pstate $COPY)" != T ]]; do sleep 0.1; done
+check "копия по подписи всё равно заморожена (когда ps и codesign ответили)" test "$(pstate $COPY)" = T
+check "ни одного круга дольше 2 с" test ! -s /tmp/vafa-slow-cycles.log
+stop_daemon; kill -CONT $COPY 2>/dev/null; kill $COPY 2>/dev/null; iface utun9
+
+# ---- 53. демон стоял 4 с: перепроверка без обрыва открытых соединений ---------------------
+# 2026-11-19 18:53:58: демон простоял 5,6 с (перегрузка), очнулся, засчитал простой как
+# «Cloudflare молчит» и оборвал соединения, хотя VPN работал. Теперь после простоя: новые
+# соединения закрыты (hold), открытые не рвутся, страна перепроверяется; обрыв — только если
+# перепроверка не удалась.
+print "53. после простоя демона: hold и перепроверка, открытые соединения не рвутся"
+pf_reset; iface utun9; geo DE; rm -f $T/hang $T/hang1 $T/hang1.used
+INTERVAL=1 GEO_TTL=1 GEO_STALE=60 conf route geo
+GEO_URLS_T="http://127.0.0.1:$SPORT/trace http://127.0.0.1:$SPORT/trace http://127.0.0.1:$SPORT/trace" start_daemon; vpn_is true 5
+sleep 1.5; : > $T/pf/calls.log
+kill -STOP $DPID; sleep 4.5; kill -CONT $DPID
+check "после простоя снова up" eval 'sleep 2.5; st "\"state\":\"up\""'
+check "в журнале — «демон стоял»" grep -q "демон стоял дольше" $T/daemon.log
+check "открытые соединения не рвали" eval '! calls | grep -q "^kill"'
+: > $T/pf/calls.log; touch $T/hang
+kill -STOP $DPID; sleep 4.5; kill -CONT $DPID
+check "простой, и Cloudflare молчит — «не уверен»" wait_status '"state":"unsure"' 8
+check "сразу после простоя соединения ещё не рвали (идёт перепроверка)" eval '! calls | grep -q "^kill"'
+i=0; while (( i++ < 70 )) && ! calls | grep -q "^kill"; do sleep 0.1; done
+check "перепроверка не удалась за ~3 с — соединения оборваны" eval 'calls | grep -q "^kill"'
+rm -f $T/hang
+check "ответ пришёл — снова up" wait_status '"state":"up"' 6
+stop_daemon
+
+# ---- 54. загрузочный замок ---------------------------------------------------------------
+# Правила pf при перезагрузке стираются; пока демон не стартовал, якорь пуст. Замок
+# (vpn-guard-bootlock, sh) при загрузке ставит сохранённый демоном набор «закрыто».
+print "54. загрузочный замок: закрыто до старта демона"
+blk() { VPN_GUARD_STATE=$T/state VPN_GUARD_PFCTL=$FAKEPF FAKE_PF_DIR=$T/pf sh ./vpn-guard-bootlock }
+pf_reset; iface utun9; geo DE; rm -f $T/state/boot.rules
+INTERVAL=1 conf route geo; start_daemon; vpn_is true 5
+check "демон сохранил набор для замка" test -s $T/state/boot.rules
+check "в наборе block и таблица, пропуска нет" eval 'grep -q "^block return out quick to <vpnguard>" $T/state/boot.rules && grep -q "^table <vpnguard>" $T/state/boot.rules && ! grep -q "^pass" $T/state/boot.rules'
+: > $T/pf/calls.log; blk
+check "демон работает (якорь занят) — замок ничего не трогает" eval 'pf_has_pass && ! calls | grep -q "^load"'
+stop_daemon
+pf_reset; rm -f $T/state/pf.token; : > $T/pf/calls.log    # «после перезагрузки»: якорь пуст, pf выключен
+blk
+check "после «перезагрузки»: в якоре block, пропуска нет" eval 'grep -q "^block" $T/pf/anchor.rules && ! pf_has_pass'
+check "pf включён, токен сохранён для демона" eval 'test -e $T/pf/enabled && test -s $T/state/pf.token'
+check "адреса на месте (160.79.104.0/21 в таблице)" grep -q '160.79.104.0/21' $T/pf/anchor.table
+VPN_GUARD_TEST=1 VPN_GUARD_CONF=$T/conf VPN_GUARD_STATE=$T/state VPN_GUARD_APPS=$T/no-apps-file \
+  VPN_GUARD_COUNTRIES=$T/countries VPN_GUARD_IFACE_FILE=$T/iface VPN_GUARD_PFCTL=$FAKEPF FAKE_PF_DIR=$T/pf \
+  VPN_GUARD_FREEZE_CLI=0 zsh ./vpn-guard unlock > /dev/null 2>&1
+check "«охрана выключена» стирает набор замка" test ! -e $T/state/boot.rules
+pf_reset; : > $T/pf/calls.log; blk
+check "охрана выключена — замок при загрузке ничего не делает" eval '! calls | grep -q "^load" && test ! -e $T/pf/anchor.rules'
+
 print
 print "итог: прошло $PASS, упало $FAIL"
 (( FAIL == 0 ))

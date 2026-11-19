@@ -475,7 +475,7 @@ _nc_connected() {
 # Как часто: раз в GEO_TTL с (по умолчанию каждую секунду; GEO_TTL_DOWN — при блокировке)
 # и сразу же — по событию сети (см. wait_tick). Запрос — 1 КБ, curl живёт доли секунды.
 typeset -g GEO_LAST_T=0 GEO_LAST_IF='' GEO_LAST_CC='' GEO_GOOD_T=0 GEO_GOOD_CC='' GUARD_DOWN=0
-typeset -g GEO_FRESH=0 GEO_UNSURE=0 GEO_PEND=0
+typeset -g GEO_FRESH=0 GEO_UNSURE=0 GEO_PEND=0 GEO_SOFT=0 UNSURE_KILLED=0
 typeset -g GEO_ASYNC=0 GEO_JOB_N=0 GEO_WAKE=0   # фоновый опрос страны (только демон)
 GEO_WAIT=1   # сколько секунд круг ждёт ответа о стране, когда он нужен сразу (после события)
 typeset -ga GEO_URLS=( https://1.1.1.1/cdn-cgi/trace https://1.0.0.1/cdn-cgi/trace
@@ -518,7 +518,7 @@ _geo_apply() {
       warn_once "geostale:$GEO_GOOD_T" "Cloudflare не ответил — сеть к Anthropic закрыта, приложения не морожу (прошлая страна $cc)"
     fi
   fi
-  GEO_LAST_CC=$cc GEO_LAST_T=$t GEO_LAST_IF=$i GEO_PEND=0 GEO_WAKE=0
+  GEO_LAST_CC=$cc GEO_LAST_T=$t GEO_LAST_IF=$i GEO_PEND=0 GEO_WAKE=0 GEO_SOFT=0
 }
 
 # ---- фоновый опрос страны (демон, GEO_ASYNC=1) -------------------------------
@@ -597,6 +597,20 @@ _geo_refresh() {
   fi
 
   (( GEO_FLUSH )) && _geo_jobs_drop
+  # Демон сам стоял дольше CY_SLOW с (перегрузка Мака, сон): всё это время он не мог ни
+  # спросить страну, ни забрать ответ. Раньше эти секунды засчитывались как «Cloudflare
+  # молчит» и соединения рвались (журнал 2026-11-19 18:53:58, запуск эмулятора). Теперь:
+  # старые ответы не годятся — спросить заново; пока ответа нет, новые соединения закрыты
+  # (hold), а открытые не рвём (GEO_SOFT) — они остаются на прежнем выходе. Ответ плохой или
+  # его нет GEO_DEAD секунд — рвём, как обычно.
+  if (( LOOP_STALLED )); then
+    LOOP_STALLED=0
+    if [[ $i == $GEO_LAST_IF && -n $GEO_LAST_CC ]] && (( GEO_LAST_T && GEO_FRESH )); then
+      _geo_jobs_drop
+      GEO_LAST_T=0 GEO_SOFT=1
+      log_every stall 60 "демон стоял дольше ${CY_SLOW} с — страну перепроверяю: новые соединения к Anthropic закрыты, открытые не рву"
+    fi
+  fi
   _geo_collect $i
   # ждём первого ответа: после события сети (GEO_LAST_T=0) или на новом интерфейсе
   { [[ $i != $GEO_LAST_IF ]] || (( GEO_LAST_T == 0 )) } && await=1
@@ -707,7 +721,128 @@ app_exe_names() {
 # снимок раз в PS_EVERY с, а при блокировке и при смене состояния — каждый круг.
 typeset -g PS_SNAP='' PS_DIRTY=0 PS_T=0 PS_EVERY=5 PS_GEN=0
 typeset -gA APC=()   # разбор снимка по приложениям — до следующего снимка
-ps_snap() { PS_SNAP=$(ps -axww -o pid=,stat=,comm= 2>/dev/null); PS_DIRTY=0 PS_T=$EPOCHSECONDS; APC=(); (( ++PS_GEN )) }
+# Демон (BG_ASYNC=1) снимает список процессов фоновой задачей и ждёт её не дольше BG_WAIT:
+# под перегрузкой Мака сам ps отвечал по 5 с (журнал 2026-11-19 18:53:58 «круг занял 5.6 с …
+# ps=5521»), и всё это время демон не видел ни маршрута, ни ответов о стране. Не успела —
+# круг идёт со старым снимком, свежий подберётся, как только будет готов (bg_ready будит круг).
+# Вместе со снимком — дерево pid/ppid для заморозки CLI (cli_tree_r), чтобы и оно не ждало ps.
+typeset -g BG_ASYNC=0 BG_WAIT=0.15 BG_REDO=0 PS_JOB=0 PS_JOB_N=0 PS_JOB_T=0 PS_TREE=''
+ps_take() {
+  (( PS_JOB )) || return 1
+  local f=$STATE_DIR/ps.job.$PS_JOB_N
+  if [[ -e $f ]]; then
+    PS_SNAP=$(<$f); PS_TREE=''; [[ -e $f.tree ]] && PS_TREE=$(<$f.tree)
+    rm -f -- $f $f.tree
+    PS_JOB=0 PS_DIRTY=0 PS_T=$EPOCHSECONDS; APC=(); (( ++PS_GEN ))
+    return 0
+  fi
+  # умерла без результата или висит дольше 15 с — снять, следующий вызов запустит новую
+  if ! kill -0 $PS_JOB 2>/dev/null || (( EPOCHSECONDS - PS_JOB_T > 15 || EPOCHSECONDS < PS_JOB_T )); then
+    kill $PS_JOB 2>/dev/null; rm -f -- $f.tmp $f.tree.tmp $f.tree; PS_JOB=0
+  fi
+  return 1
+}
+ps_snap() {
+  if (( ! BG_ASYNC )); then
+    PS_SNAP=$(ps -axww -o pid=,stat=,comm= 2>/dev/null); PS_TREE=''
+    PS_DIRTY=0 PS_T=$EPOCHSECONDS; APC=(); (( ++PS_GEN ))
+    return 0
+  fi
+  local f tend
+  # готовый снимок задачи, начатой раньше, не годится: его просят после изменений (PS_DIRTY)
+  (( PS_JOB )) && [[ -e $STATE_DIR/ps.job.$PS_JOB_N ]] && { rm -f -- $STATE_DIR/ps.job.$PS_JOB_N{,.tree}; PS_JOB=0 }
+  (( PS_JOB )) && ps_take
+  if (( ! PS_JOB )); then
+    (( ++PS_JOB_N )); f=$STATE_DIR/ps.job.$PS_JOB_N
+    { ps -axo pid=,ppid= > $f.tree.tmp 2>/dev/null
+      ps -axww -o pid=,stat=,comm= > $f.tmp 2>/dev/null && mv -f -- $f.tree.tmp $f.tree && mv -f -- $f.tmp $f } &!
+    PS_JOB=$! PS_JOB_T=$EPOCHSECONDS
+  fi
+  tend=$(( EPOCHREALTIME + BG_WAIT ))
+  while (( EPOCHREALTIME < tend )); do
+    ps_take && return 0
+    zselect -t 1 2>/dev/null
+  done
+  return 0
+}
+
+# ---- подписи в фоне ---------------------------------------------------------
+# codesign на незнакомый бандл/файл — десятки-сотни мс, а при запуске симулятора, эмулятора,
+# Xcode таких сразу десятки (журнал 2026-11-19 18:49:31 «круг занял 10.8 с … act=10764»).
+# Демон не спрашивает подпись в круге: кладёт путь в очередь SIG_Q, отвечает «пока не знаю»,
+# фоновая задача спрашивает codesign, sig_pump забирает ответы в кэш SIGC и просит круг
+# повториться сразу (BG_REDO). Копия приложения в чужой папке морозится на круг позже;
+# сеть к адресам закрыта правилом pf независимо от этого.
+typeset -g SIG_JOB=0 SIG_JOB_N=0 SIG_JOB_T=0
+typeset -gA SIG_Q=()   # «b:бандл» / «f:файл» → ключ «inode:mtime»
+
+# подпись через codesign → REPLY («команда:id», «adhoc:id:cdhash» или пусто)
+codesign_sig_r() {
+  local line id='' team='' cd=''
+  REPLY=''
+  for line in ${(f)"$(codesign -dvvv -- $1 2>&1)"}; do
+    case $line in
+      Identifier=*) id=${line#*=} ;;
+      TeamIdentifier=*) team=${line#*=} ;;
+      CDHash=*) cd=${line#*=} ;;
+    esac
+  done
+  if [[ -n $id && -n $team && $team != 'not set' ]]; then REPLY="$team:$id"
+  elif [[ -n $id && -n $cd ]]; then REPLY="adhoc:$id:$cd"; fi
+  return 0
+}
+
+# $1=1 — запустить задачу на очередь и подождать её до BG_WAIT; 0 — только забрать готовое
+sig_pump() {
+  (( BG_ASYNC )) || return 0
+  local f=$STATE_DIR/sig.job.$SIG_JOB_N line kp k tend tab=$'\t'
+  sig_take() {
+    [[ -e $f ]] || return 1
+    for line in ${(f)"$(<$f)"}; do          # «вид:путь<TAB>ключ<TAB>подпись»
+      kp=${line%%$tab*}; line=${line#*$tab}; k=${line%%$tab*}
+      if [[ $kp == b:* ]]; then SIGC[${kp#b:}]="$k|${line#*$tab}"; else SIGC[$kp]="$k|${line#*$tab}"; fi
+      unset "SIG_Q[$kp]"
+    done
+    rm -f -- $f; SIG_JOB=0; APC=(); SIG_GEN=-1; BG_REDO=1
+    return 0
+  }
+  if (( SIG_JOB )); then
+    sig_take
+    if (( SIG_JOB )) && { ! kill -0 $SIG_JOB 2>/dev/null || (( EPOCHSECONDS - SIG_JOB_T > 60 || EPOCHSECONDS < SIG_JOB_T )) }; then
+      sig_take || { kill $SIG_JOB 2>/dev/null; rm -f -- $f.tmp; SIG_JOB=0 }
+    fi
+  fi
+  (( $1 )) || return 0
+  if (( ! SIG_JOB && ${#SIG_Q} )); then
+    (( ++SIG_JOB_N )); f=$STATE_DIR/sig.job.$SIG_JOB_N
+    # сначала приложения из списка охраны (по их подписи ищутся копии), пачками по 8 —
+    # чтобы ответ про нужное не ждал десятков посторонних программ
+    local a
+    local -a order=() keys=( ${(k)SIG_Q} )
+    for a in $APPS[@]; do (( ${+SIG_Q[b:$a]} )) && order+=( b:$a ); done
+    order+=( ${keys:|order} ); order=( ${order[1,8]} )
+    { for kp in $order[@]; do
+        codesign_sig_r ${kp#?:}
+        print -r -- "$kp$tab$SIG_Q[$kp]$tab$REPLY"
+      done > $f.tmp; mv -f -- $f.tmp $f } &!
+    SIG_JOB=$! SIG_JOB_T=$EPOCHSECONDS
+  fi
+  (( SIG_JOB )) || return 0
+  tend=$(( EPOCHREALTIME + BG_WAIT ))
+  while (( EPOCHREALTIME < tend )); do
+    sig_take && return 0
+    zselect -t 1 2>/dev/null
+  done
+  return 0
+}
+
+# готов ответ какой-нибудь фоновой задачи — круг не ждёт INTERVAL
+bg_ready() {
+  (( ${#GEO_JOBS} && GEO_WAKE )) && geo_ready && return 0
+  (( SIG_JOB )) && [[ -e $STATE_DIR/sig.job.$SIG_JOB_N ]] && return 0
+  (( PS_JOB )) && [[ -e $STATE_DIR/ps.job.$PS_JOB_N ]] && return 0
+  return 1
+}
 
 # ---- копии бандла: поиск по подписи (MATCH_SIGNATURE) ------------------------
 # Копию Claude.app в другой папке путь не ловит. Подпись у копии та же: команда
@@ -729,15 +864,8 @@ bundle_sig_r() {
   zstat -H h -- $b/Contents/Info.plist 2>/dev/null || return 1
   k="${h[inode]}:${h[mtime]}"
   if [[ -n ${SIGC[$b]:-} && ${SIGC[$b]%%|*} == $k ]]; then REPLY=${SIGC[$b]#*|}; return 0; fi
-  for line in ${(f)"$(codesign -dvvv -- $b 2>&1)"}; do
-    case $line in
-      Identifier=*) id=${line#*=} ;;
-      TeamIdentifier=*) team=${line#*=} ;;
-      CDHash=*) cd=${line#*=} ;;
-    esac
-  done
-  if [[ -n $id && -n $team && $team != 'not set' ]]; then REPLY="$team:$id"
-  elif [[ -n $id && -n $cd ]]; then REPLY="adhoc:$id:$cd"; fi
+  if (( BG_ASYNC )); then SIG_Q[b:$b]=$k; return 0; fi   # спросит фоновая задача (sig_pump)
+  codesign_sig_r $b
   SIGC[$b]="$k|$REPLY"
   return 0
 }
@@ -822,15 +950,8 @@ file_sig_r() {
   zstat -H h -- $f 2>/dev/null || return 1
   k="${h[inode]}:${h[mtime]}"
   if [[ -n ${SIGC[f:$f]:-} && ${SIGC[f:$f]%%|*} == $k ]]; then REPLY=${SIGC[f:$f]#*|}; return 0; fi
-  for line in ${(f)"$(codesign -dvvv -- $f 2>&1)"}; do
-    case $line in
-      Identifier=*) id=${line#*=} ;;
-      TeamIdentifier=*) team=${line#*=} ;;
-      CDHash=*) cd=${line#*=} ;;
-    esac
-  done
-  if [[ -n $id && -n $team && $team != 'not set' ]]; then REPLY="$team:$id"
-  elif [[ -n $id && -n $cd ]]; then REPLY="adhoc:$id:$cd"; fi
+  if (( BG_ASYNC )); then SIG_Q[f:$f]=$k; return 0; fi   # спросит фоновая задача (sig_pump)
+  codesign_sig_r $f
   SIGC[f:$f]="$k|$REPLY"
   return 0
 }
@@ -875,7 +996,8 @@ cli_tree_r() {
   for l in $reply[@]; do roots+=( ${l%% *} ); done
   reply=()
   (( ${#roots} )) || return 0
-  for l in ${(f)"$(ps -axo pid=,ppid= 2>/dev/null)"}; do
+  [[ -n $PS_TREE ]] && l=$PS_TREE || l=$(ps -axo pid=,ppid= 2>/dev/null)
+  for l in ${(f)l}; do
     w=( ${=l} ); (( ${#w} == 2 )) || continue
     kids[$w[2]]+=" $w[1]"
   done
@@ -1106,6 +1228,17 @@ pf_rules_fallback() {
   print -r -- "block return out quick to <vpnguard>"
 }
 
+# Набор «закрыто» для загрузочного замка (vpn-guard-bootlock): те же адреса, что сейчас в
+# таблице, и block без пропуска. Пишется, когда меняется; стирается в unlock.
+typeset -g BOOT_RULES_LAST=''
+boot_rules_save() {
+  (( GEO_ASYNC )) || return 0          # только демон: check/status файл не трогают
+  local r; r=$(pf_rules '')
+  [[ $r == $BOOT_RULES_LAST && -s $STATE_DIR/boot.rules ]] && return 0
+  print -r -- $r > $STATE_DIR/boot.rules.tmp && mv -f -- $STATE_DIR/boot.rules.tmp $STATE_DIR/boot.rules && BOOT_RULES_LAST=$r
+  return 0
+}
+
 pf_enable() {
   # после перезагрузки pf выключен, а старый токен остаётся на диске —
   # поэтому смотреть на реальный статус, а не на наличие файла
@@ -1235,6 +1368,7 @@ pf_apply() {
   fi
   # код возврата pfctl не доказывает, что правила на месте — проверить глазами
   if pf_verify $mode; then
+    boot_rules_save
     if [[ -n $via ]]; then tun_id_r $via; TUN_ID=$REPLY; TUN_IDX=${${REPLY#*|}%%|*}; fi
     PF_CUR=$mode PF_RELOAD=0 PF_FB=0
     pf_say $mode
@@ -1450,11 +1584,12 @@ typeset -g NET_FD='' NET_RETRY_T=0 NET_EVENT=0 NET_HARD=0 CYCLE_T0=0 CYCLE_N=0
 # Самодиагностика: круг (без ожидания) дольше CY_SLOW с — в журнал, по шагам. В тестах
 # 2026-11-18 круг изредка замирал на несколько секунд (заморозка через 5,5 с вместо 1),
 # а чем был занят — видно не было.
-typeset -g CY_MARKS='' CY_SLOW=2
+typeset -g CY_MARKS='' CY_SLOW=2 LOOP_STALLED=0
 cy_mark() { CY_MARKS+=" $1=$(( (EPOCHREALTIME - CYCLE_T0) * 1000 ))" }
 cy_report() {
   local d=$(( EPOCHREALTIME - CYCLE_T0 )) m w
   (( d >= CY_SLOW )) || return 0
+  LOOP_STALLED=1
   for w in ${=CY_MARKS}; do m+=" ${w%%=*}=${${w#*=}%.*}"; done
   log "круг $CYCLE_N занял $(printf %.1f $d) с (мс от начала:$m)"
   [[ -n ${VPN_GUARD_SLOWLOG:-} ]] && print -r -- "$(date +%T) круг $CYCLE_N $(printf %.1f $d) с:$m" >> $VPN_GUARD_SLOWLOG
@@ -1549,19 +1684,21 @@ wait_tick() {
   (( wait > INTERVAL )) && wait=$INTERVAL
   NET_EVENT=0 NET_HARD=0
   net_watch_start
+  # фон принёс подписи — круг сразу (копия приложения морозится без ожидания INTERVAL)
+  if (( BG_REDO )); then BG_REDO=0; return 0; fi
   if [[ -z $NET_FD ]]; then
     geo_wait $wait || sleep $wait
     return 0
   fi
   local got=0 eof=0 r0
-  if (( ${#GEO_JOBS} && GEO_WAKE )); then
+  if (( (${#GEO_JOBS} && GEO_WAKE) || SIG_JOB || PS_JOB )); then
     # опрос страны в фоне — проснуться, как только ответ готов (новый круг сразу)
     tend=$(( EPOCHREALTIME + wait ))
     while (( EPOCHREALTIME < tend )); do
       r0=$EPOCHREALTIME
       read -t 0.05 -u $NET_FD line && { got=1; break }
       (( EPOCHREALTIME - r0 < 0.03 )) && { eof=1; break }   # поток кончился, а не таймаут
-      geo_ready && return 0
+      bg_ready && return 0
     done
     (( got || eof )) || return 0
   elif read -t $wait -u $NET_FD line; then
@@ -1632,10 +1769,10 @@ cmd_daemon() {
   $PFCTL -a $PF_ANCHOR_OLD -F all >/dev/null 2>&1   # якорь под старым именем (до 2026-10-09)
   # остановка (launchctl bootout при обновлении, kill): сеть оставить закрытой, монитор
   # убрать. «Охрана выключена» в Vafa и uninstall после остановки зовут unlock — он снимает pf.
-  GEO_ASYNC=1
+  GEO_ASYNC=1 BG_ASYNC=1
+  rm -f -- $STATE_DIR/(geo|ps|sig).job.*(N)   # ответы фоновых задач прошлого запуска
   rm -f -- $STATE_DIR/geo.job.*(N)   # ответы опросов прошлого запуска
-  rm -f -- $STATE_DIR/geo.job.*(N)   # ответы опросов прошлого запуска
-  trap 'pf_apply hold; write_status stopped; net_watch_stop; _geo_jobs_drop; exit 0' TERM INT HUP
+  trap 'pf_apply hold; write_status stopped; net_watch_stop; _geo_jobs_drop; (( PS_JOB )) && kill $PS_JOB 2>/dev/null; (( SIG_JOB )) && kill $SIG_JOB 2>/dev/null; exit 0' TERM INT HUP
   local a last=init state prev_state=init down_since=0 mt why wt0
   conf_mtime; mt=$REPLY
   log "vpn-guard запущен: правила=[${VPN_CHECK[*]}] ($VPN_REQUIRE), при падении VPN=$ON_DOWN, блокировка запуска=$LOCK_LAUNCH, интервал=${INTERVAL}с, страны блокировки: ${BAD_CC[*]:-не заданы}; сеть к Anthropic закрыта до первой проверки"
@@ -1676,6 +1813,7 @@ cmd_daemon() {
     fi
     # сеть поменялась — имена перерезолвить тем же DNS, каким сейчас пользуются приложения
     cy_mark route
+    ps_take; sig_pump 0     # готовые ответы фоновых задач — в кэш
     hosts_refresh $NET_EVENT
     cy_mark hosts
 
@@ -1700,6 +1838,7 @@ cmd_daemon() {
 
     case $state in
       (up)
+        UNSURE_KILLED=0
         pf_mode_when_up
         pf_apply $REPLY               # сеть — до разморозки
         if [[ $last != up ]]; then
@@ -1720,13 +1859,20 @@ cmd_daemon() {
         pf_apply hold                 # приложения не трогаем — ни морозим, ни размораживаем
         # вошли в «не уверен» — оборвать открытые соединения один раз: через туннель с
         # неподтверждённым выходом не должно ходить и то, что открыли раньше
-        [[ $prev_state != unsure ]] && (( PF_KILL_CYCLE != CYCLE_N )) && pf_kill_states
+        # После простоя демона (GEO_SOFT) открытые не рвём, пока идёт перепроверка: закрыты
+        # только новые. Перепроверка не удалась — GEO_SOFT снят, и обрыв случится здесь же.
+        if (( ! GEO_SOFT && ! UNSURE_KILLED )); then
+          (( PF_KILL_CYCLE != CYCLE_N )) && pf_kill_states
+          UNSURE_KILLED=1
+        fi
         # причина — в журнал: после события сети ждём первый ответ, или Cloudflare молчит
         if (( ! GEO_UNSURE )); then why='VPN пропал, идёт GRACE'
+        elif (( GEO_SOFT )); then why='после простоя демона, перепроверяю; открытые соединения не рву'
         elif (( GEO_PEND )); then why='после события сети, жду ответ'; else why="Cloudflare не отвечает ${GEO_DEAD} с"; fi
         log_every unsure 60 "страна выхода не подтверждена ($why; маршрут: $CUR_IF, страна: ${GEO_LAST_CC:-?}) — сеть к Anthropic закрыта, приложения не трогаю"
         ;;
       (down)
+        UNSURE_KILLED=0
         pf_apply block                # сеть — первой, до заморозки
         if [[ $last != down ]]; then
           log "VPN не обнаружен (маршрут: ${CUR_IF:-нет}, страна: ${GEO_LAST_CC:-?}) — блокирую"
@@ -1750,6 +1896,7 @@ cmd_daemon() {
     esac
     # CLI убрали из охраны (FREEZE_CLI=0), пока он заморожен, — разморозить и вернуть запуск
     if (( ! FREEZE_CLI && CLI_FROZEN )); then resume_cli; unlock_app $CLI_KEY; fi
+    sig_pump 1              # незнакомые подписи — спросить в фоне (ждём не дольше BG_WAIT)
     cy_mark act
     write_status $state
     cy_mark status
@@ -1759,6 +1906,7 @@ cmd_daemon() {
     wait_tick
     # ожидание не должно быть дольше INTERVAL: если вышло — тоже в журнал
     if (( EPOCHREALTIME - wt0 > INTERVAL + CY_SLOW )); then
+      LOOP_STALLED=1
       log "ожидание между кругами заняло $(printf %.1f $(( EPOCHREALTIME - wt0 ))) с при INTERVAL=$INTERVAL"
       [[ -n ${VPN_GUARD_SLOWLOG:-} ]] && print -r -- "$(date +%T) ожидание $(printf %.1f $(( EPOCHREALTIME - wt0 ))) с, INTERVAL=$INTERVAL" >> $VPN_GUARD_SLOWLOG
     fi
@@ -1873,6 +2021,7 @@ cmd_unlock() {
   local a
   for a in $APPS[@]; do resume_app $a >/dev/null; done
   CLI_FROZEN=1; resume_cli >/dev/null 2>&1
+  rm -f -- $STATE_DIR/boot.rules   # охрана выключена — загрузочный замок тоже
   pf_off
   PF_WANT=''
   write_status stopped   # чтобы щит не показывал «сеть закрыта» от остановленного демона
@@ -1885,6 +2034,10 @@ cmd_uninstall() {
   launchctl bootout system $PLIST 2>/dev/null
   cmd_unlock
   rm -f $PLIST
+  if [[ ${VPN_GUARD_TEST:-} != 1 ]]; then
+    launchctl bootout system $BOOT_PLIST 2>/dev/null
+    rm -f $BOOT_PLIST /usr/local/bin/vpn-guard-bootlock
+  fi
   rm -rf $STATE_DIR
   print -r -- "Демон снят и выгружен."
   print -r -- "Остались (удали вручную, если не нужны): /usr/local/bin/vpn-guard, $CONF"
@@ -1899,6 +2052,7 @@ cmd_uninstall() {
 # UNINSTALL_WAIT секунд: поставилась новая версия (демон снова загружен) — это было
 # обновление, ничего не трогаем; нет — настоящее удаление, снимаем всё.
 UNINSTALL_WAIT=${VPN_GUARD_UNINSTALL_WAIT:-120}
+BOOT_PLIST=/Library/LaunchDaemons/local.vpnguard.bootlock.plist
 UNINSTALL_LOG=${VPN_GUARD_LOG:-/usr/local/var/log/vpn-guard.log}
 
 daemon_loaded() {

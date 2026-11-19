@@ -9,7 +9,7 @@ SRC=${0:A:h}
 CONF=/usr/local/etc/vpn-guard.conf
 PLIST=/Library/LaunchDaemons/local.vpnguard.plist
 
-for f in vpn-guard vpn-guard.conf local.vpnguard.plist; do
+for f in vpn-guard vpn-guard.conf local.vpnguard.plist vpn-guard-bootlock local.vpnguard.bootlock.plist; do
   [[ -f $SRC/$f ]] || { print -ru2 -- "нет файла $SRC/$f"; exit 1 }
 done
 
@@ -18,6 +18,7 @@ install -d -m 755 -o root -g wheel /usr/local/bin /usr/local/etc /usr/local/var/
 install -d -m 755 -o root -g wheel /usr/local/var/vpn-guard
 install -d -m 700 -o root -g wheel /usr/local/var/vpn-guard/perms
 install -m 755 -o root -g wheel $SRC/vpn-guard /usr/local/bin/vpn-guard
+install -m 755 -o root -g wheel $SRC/vpn-guard-bootlock /usr/local/bin/vpn-guard-bootlock
 
 fresh=0 migrated=0
 if [[ ! -e $CONF ]]; then
@@ -77,12 +78,15 @@ IR" > $COUNTRIES
 fi
 
 install -m 644 -o root -g wheel $SRC/local.vpnguard.plist $PLIST
+# загрузочный замок: при старте системы закрывает сеть к адресам, не дожидаясь демона
+BOOT_PLIST=/Library/LaunchDaemons/local.vpnguard.bootlock.plist
+install -m 644 -o root -g wheel $SRC/local.vpnguard.bootlock.plist $BOOT_PLIST
 
 # Файлы из скачанного DMG (Homebrew, браузер) помечены карантином, и install его переносит.
 # launchd на новых macOS не загружает такую службу: «Plist has the com.apple.quarantine xattr
 # set … Refusing to execute/trust quarantined program/file» — снаружи это «Bootstrap failed: 5»
 # (macOS 27.2.1 через brew, журнал launchd 2026-11-17). Снять со всего, что поставили.
-for f in /usr/local/bin/vpn-guard $PLIST $CONF $COUNTRIES /usr/local/etc/vpn-guard.apps; do
+for f in /usr/local/bin/vpn-guard /usr/local/bin/vpn-guard-bootlock $PLIST $BOOT_PLIST $CONF $COUNTRIES /usr/local/etc/vpn-guard.apps; do
   [[ -e $f ]] && xattr -d com.apple.quarantine $f 2>/dev/null || true
 done
 
@@ -100,6 +104,12 @@ for i in {1..5}; do
   launchctl print system/local.vpnguard >/dev/null 2>&1 && { LOADED=1; break; }   # уже загружена
   sleep 2
 done
+# замок: зарегистрировать, чтобы сработал при следующей загрузке системы. Сейчас он ничего
+# не изменит (якорь pf уже занят демоном). Не загрузился — не беда для установки: демон и
+# сам первым делом закрывает сеть, замок — страховка.
+launchctl bootout system $BOOT_PLIST 2>/dev/null || true
+launchctl enable system/local.vpnguard.bootlock 2>/dev/null || true
+launchctl bootstrap system $BOOT_PLIST 2>/dev/null || print -ru2 -- "замечание: загрузочный замок не зарегистрирован (launchctl bootstrap $BOOT_PLIST)"
 (( LOADED )) || print -ru2 -- "ВНИМАНИЕ: демон не загрузился (launchctl bootstrap). Повторить: sudo launchctl bootstrap system $PLIST"
 
 # мини-приложение в строке меню (собирается ./app/build.sh)
@@ -124,6 +134,7 @@ print -r -- "  /usr/local/bin/vpn-guard"
 print -r -- "  $CONF"
 print -r -- "  $COUNTRIES  (страны блокировки)"
 print -r -- "  $PLIST  (демон загружен)"
+print -r -- "  $BOOT_PLIST  (замок при загрузке системы)"
 print -r -- "  журнал: /usr/local/var/log/vpn-guard.log"
 print -r -- ""
 if (( ! fresh )); then

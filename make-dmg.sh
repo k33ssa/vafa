@@ -6,7 +6,7 @@ cd ${0:A:h}
 ./app/build.sh
 STAGE=$(mktemp -d)/"Vafa"
 mkdir -p "$STAGE/app"
-cp vpn-guard vpn-guard.conf local.vpnguard.plist install.sh INSTALL.md "$STAGE/"
+cp vpn-guard vpn-guard-bootlock vpn-guard.conf local.vpnguard.plist local.vpnguard.bootlock.plist install.sh INSTALL.md "$STAGE/"
 cp -R "app/Vafa.app" "$STAGE/app/"
 rm -f Vafa.dmg
 hdiutil create -quiet -volname "Vafa" -srcfolder "$STAGE" -format UDZO Vafa.dmg

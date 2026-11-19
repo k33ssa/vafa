@@ -20,6 +20,7 @@ GitHub: `k33ssa/vafa`. Задачи — [TODO.md](TODO.md), журнал — `do
 | `vpn-guard` | macOS: демон (zsh, root, LaunchDaemon `local.vpnguard`). Подкоманды daemon/status/check/lock/unlock/uninstall |
 | `vpn-guard.conf` | настройки по умолчанию; ставится в `/usr/local/etc/` **только если там нет** — дальше install.sh лишь мигрирует известные старые значения |
 | `local.vpnguard.plist` | LaunchDaemon (`ProcessType=Interactive` — с Background круг шёл раз в 4 с) |
+| `vpn-guard-bootlock`, `local.vpnguard.bootlock.plist` | загрузочный замок (sh, без zsh и конфига): при старте системы грузит в якорь pf набор «закрыто» из `boot.rules`, который пишет демон; «Охрана выключена»/удаление файл стирают |
 | `install.sh`, `make-dmg.sh` | установка (sudo) и DMG. Релизы на GitHub: `Vafa-<версия>.dmg` + `Vafa-<версия>-windows.zip` (папка `windows/` как есть); Homebrew — cask `vafa` в `k33ssa/homebrew-tap` (версию и sha256 править там при новом релизе) |
 | `app/main.swift`, `app/build.sh` | щит в строке меню; читает `/usr/local/var/vpn-guard/status.json` |
 | `windows/` | PowerShell-служба (задача Планировщика от SYSTEM), трей, install.cmd |
@@ -39,6 +40,11 @@ GitHub: `k33ssa/vafa`. Задачи — [TODO.md](TODO.md), журнал — `do
 не трогаются; **down** → pf `block` первым делом, затем заморозка и `chmod a-x`. Режима «без правил»
 нет. pf сверяется каждый круг (`pf_verify`) и чинится. Адреса: `BLOCK_NETS` + `BLOCK_HOSTS`
 (резолв в фоне, кэш `hosts.ips`).
+
+Медленное — в фоне (с 2026-11-19): `ps` и `codesign` демон в круге не ждёт дольше 0,15 с (`ps_snap`/`ps_take`,
+`sig_pump`, очередь `SIG_Q`), опрос страны — независимые запросы раз в секунду (`GEO_JOBS`). Круг дольше 2 с пишется в
+журнал по шагам (`cy_mark`/`cy_report`) и ставит `LOOP_STALLED`: страна перепроверяется, новые соединения закрыты
+(hold), открытые не рвутся, пока перепроверка не провалилась (`GEO_SOFT`).
 
 ## Запуск тестов
 

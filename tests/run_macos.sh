@@ -232,8 +232,9 @@ h0=$(geo_hits)
 cyc() { grep -o '"cycle":[0-9]*' $T/state/status.json 2>/dev/null | cut -d: -f2 }
 c0=$(cyc); sleep 30; c1=$(cyc)
 n=$(( c1 - c0 ))
-# счётчик кругов из status.json: самоподбуживание дало бы больше 33 (метки времени — нет)
-check "за 30 с кругов ${n} (ждём ~30 при INTERVAL=1, без самоподбуживания)" test $n -ge 25 -a $n -le 33
+# счётчик кругов из status.json: самоподбуживание (демон будит себя своим же route get) дало бы
+# сотни кругов. До 40 — норма: фоновые задачи (подписи, ps) дают внеочередной круг, когда готовы
+check "за 30 с кругов ${n} (ждём 30–40 при INTERVAL=1, без самоподбуживания)" test $n -ge 25 -a $n -le 40
 h=$(( $(geo_hits) - h0 ))
 check "за 30 с запросов страны: ${h} (ждём ~30 при GEO_TTL=1)" test $h -ge 25 -a $h -le 33
 cpu=$(ps -o time= -p $DPID | tr -d ' ')
@@ -851,8 +852,11 @@ class H(http.server.BaseHTTPRequestHandler):
         try: os.rename(d+"/hang1", d+"/hang1.used"); one=True     # зависает один запрос
         except OSError: one=False
         while one or os.path.exists(d+"/hang"): time.sleep(0.1)
+        try: time.sleep(float(open(d+"/delay").read()))          # медленный ответ (тест 55)
+        except (OSError, ValueError): pass
         b=open(d+"/www/trace","rb").read()
-        self.send_response(200); self.send_header("Content-Length",str(len(b))); self.end_headers(); self.wfile.write(b)
+        try: self.send_response(200); self.send_header("Content-Length",str(len(b))); self.end_headers(); self.wfile.write(b)
+        except OSError: pass          # curl уже ушёл по таймауту
     def log_message(self,*a): pass
 http.server.ThreadingHTTPServer(("127.0.0.1",int(sys.argv[1])),H).serve_forever()' $SPORT $T &
 PIDS+=$!
@@ -953,6 +957,26 @@ VPN_GUARD_TEST=1 VPN_GUARD_CONF=$T/conf VPN_GUARD_STATE=$T/state VPN_GUARD_APPS=
 check "«охрана выключена» стирает набор замка" test ! -e $T/state/boot.rules
 pf_reset; : > $T/pf/calls.log; blk
 check "охрана выключена — замок при загрузке ничего не делает" eval '! calls | grep -q "^load" && test ! -e $T/pf/anchor.rules'
+
+# ---- 55. ответы по 2,4 с — это не молчание ----------------------------------------------
+# 2026-11-20, туннель Throne: каждый третий ответ Cloudflare идёт 2,2–2,4 с. Порог «3 с без
+# ответа» считался в целых секундах и срабатывал через 2–3 с — ложный обрыв каждые 5–20 мин.
+print "55. все ответы Cloudflare по 2,4 с — VPN остаётся up, соединения не рвутся"
+pf_reset; iface utun9; geo DE; rm -f $T/hang $T/hang1 $T/hang1.used $T/delay
+INTERVAL=1 GEO_TTL=1 GEO_STALE=60 conf route geo
+GEO_URLS_T="http://127.0.0.1:$SPORT/trace http://127.0.0.1:$SPORT/trace http://127.0.0.1:$SPORT/trace" start_daemon; vpn_is true 5
+sleep 1; : > $T/pf/calls.log; : > $T/state/seen
+print -r -- 2.4 > $T/delay
+( repeat 150; do grep -o '"state":"[a-z]*"' $T/state/status.json >> $T/state/seen 2>/dev/null; sleep 0.1; done ) &
+SEENPID=$!
+wait $SEENPID
+check "15 с ответов по 2,4 с: всё время up" eval '! grep -qv "\"up\"" $T/state/seen'
+check "соединения не рвали, сеть не закрывали" eval '! calls | grep -qE "^kill|^load-block"'
+print -r -- 3.6 > $T/delay
+check "ответы по 3,6 с (дольше порога) — «не уверен»" wait_status '"state":"unsure"' 10
+rm -f $T/delay
+check "ответы снова быстрые — up" wait_status '"state":"up"' 8
+stop_daemon
 
 print
 print "итог: прошло $PASS, упало $FAIL"

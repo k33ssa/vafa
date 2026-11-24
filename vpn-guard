@@ -532,7 +532,7 @@ _geo_apply() {
 # если GEO_DEAD секунд (3) не ответил ни один, или пусто ответили все адреса подряд.
 # После события сети ответы запросов, начатых до него, не берутся (GEO_FLUSH).
 typeset -gA GEO_JOBS=()   # номер → «pid|интерфейс|время начала»
-typeset -g GEO_START_T=0 GEO_SINCE=0 GEO_EMPTY=0 GEO_URL_I=0 GEO_FLUSH=0
+typeset -g GEO_START_T=0 GEO_SINCE=0 GEO_SINCE_R=0 GEO_EMPTY=0 GEO_URL_I=0 GEO_FLUSH=0
 GEO_DEAD=3      # столько секунд без единого ответа — «Cloudflare молчит»
 GEO_MAXJOBS=4
 
@@ -615,7 +615,11 @@ _geo_refresh() {
   # ждём первого ответа: после события сети (GEO_LAST_T=0) или на новом интерфейсе
   { [[ $i != $GEO_LAST_IF ]] || (( GEO_LAST_T == 0 )) } && await=1
   # Cloudflare молчит: GEO_DEAD секунд ни одного ответа, или пусто ответили все адреса
-  if (( GEO_SINCE )) && (( GEO_EMPTY >= ${#GEO_URLS} || EPOCHSECONDS - GEO_SINCE >= GEO_DEAD || EPOCHSECONDS < GEO_SINCE )); then
+  # Срок молчания — по точному времени (GEO_SINCE_R). В целых секундах порог «3 с» на деле
+  # срабатывал через 2–3 с: запрос, начатый в 10,9 с, считался молчащим уже в 13,0. Через
+  # Throne ответы идут по 2,2–2,4 с (замер 2026-11-20: 60 из 60 успешны, максимум 2,45 с), и
+  # это давало ложный обрыв каждые 5–20 минут (журнал 2026-11-20 15:00–16:52).
+  if (( GEO_SINCE )) && (( GEO_EMPTY >= ${#GEO_URLS} || EPOCHREALTIME - GEO_SINCE_R >= GEO_DEAD || EPOCHREALTIME < GEO_SINCE_R )); then
     s=$GEO_SINCE; GEO_SINCE=0 GEO_EMPTY=0
     _geo_apply $i '' $s
     return 0
@@ -631,7 +635,7 @@ _geo_refresh() {
     { _geo_fetch $url "$bind" $GEO_DEAD; print -r -- $REPLY > $f.tmp && mv -f -- $f.tmp $f } &!
     GEO_JOBS[$GEO_JOB_N]="$!|$i|$EPOCHSECONDS"
     GEO_START_T=$EPOCHSECONDS
-    (( GEO_SINCE )) || { GEO_SINCE=$EPOCHSECONDS; first=1 }
+    (( GEO_SINCE )) || { GEO_SINCE=$EPOCHSECONDS GEO_SINCE_R=$EPOCHREALTIME; first=1 }
   fi
   if (( await )); then
     # «не уверен»: сеть к Anthropic закрыта, приложения не трогаются
